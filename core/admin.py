@@ -282,9 +282,9 @@ class WhatsAppConfigAdmin(admin.ModelAdmin):
 admin_site.register(WhatsAppConfig, WhatsAppConfigAdmin)
 
 
-# ==============================================================================
+#=======================================================================
 # STUDENT MANAGEMENT ADMINS
-# ==============================================================================
+#=======================================================================
 
 @admin.register(Student)
 class StudentAdmin(admin.ModelAdmin):

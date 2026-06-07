@@ -811,9 +811,9 @@ class AnalyticEvent(TimeStampedModel):
         return f"{self.category} - {self.created_at}"
 
 
-# ==============================================================================
+#=
 # STUDENT MANAGEMENT MODELS
-# ==============================================================================
+#=
 
 class Student(TimeStampedModel):
     """
@@ -1150,9 +1150,9 @@ class StudentNote(TimeStampedModel):
         return f"Note for {self.student.name} by {self.author}"
 
 
-# ==============================================================================
+#=
 # CLASS/SUBJECT MANAGEMENT MODELS
-# ==============================================================================
+#=
 
 class AcademicClass(TimeStampedModel):
     """

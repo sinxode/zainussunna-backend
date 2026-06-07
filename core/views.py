@@ -10,13 +10,15 @@ from rest_framework_simplejwt.authentication import JWTAuthentication
 from rest_framework_simplejwt.exceptions import TokenError
 from .models import (
     Faculty, AcademicClass, Student, Attendance, StudentNote,
-    Program, Achievement, GalleryItem, ContentPage, Enquiry, WhatsAppConfig
+    Program, Achievement, GalleryItem, ContentPage, Enquiry, WhatsAppConfig,
+    Admission, AdmissionState, AdmissionStateLog, AdmissionEvent, InternalNote
 )
 from .serializers import (
     ProgramSerializer, AchievementSerializer, GalleryItemSerializer,
     FacultySerializer, ContentPageSerializer, EnquirySerializer,
     AdmissionCreateSerializer, AdmissionDetailSerializer, AdmissionSubmitSerializer,
-    StateTransitionSerializer, WhatsAppConfigSerializer
+    StateTransitionSerializer, WhatsAppConfigSerializer,
+    AdmissionListSerializer, AdmissionStepSerializer, InternalNoteSerializer
 )
 
 
@@ -528,9 +530,9 @@ def student_detail(request, pk):
     })
 
 
-# ==============================================================================
+#=
 # PUBLIC API VIEWSETS
-# ==============================================================================
+#=
 
 class ProgramViewSet(viewsets.ReadOnlyModelViewSet):
     """Public API for Programs - list and retrieve only"""
@@ -538,9 +540,12 @@ class ProgramViewSet(viewsets.ReadOnlyModelViewSet):
     serializer_class = ProgramSerializer
     permission_classes = [permissions.AllowAny]
     
-    def list(self, request, *args, **kwargs):
-        queryset = self.get_queryset()
-        serializer = self.get_serializer(queryset, many=True)
+    @action(detail=True, methods=['get'])
+    def schema(self, request, pk=None):
+        """Get program-specific form schema"""
+        program = self.get_object()
+        fields = program.fields.filter(is_visible=True)
+        serializer = ProgramFieldSerializer(fields, many=True)
         return Response(serializer.data)
 
 
@@ -549,11 +554,6 @@ class AchievementViewSet(viewsets.ReadOnlyModelViewSet):
     queryset = Achievement.objects.filter(is_visible=True)
     serializer_class = AchievementSerializer
     permission_classes = [permissions.AllowAny]
-    
-    def list(self, request, *args, **kwargs):
-        queryset = self.get_queryset()
-        serializer = self.get_serializer(queryset, many=True)
-        return Response(serializer.data)
 
 
 class GalleryViewSet(viewsets.ReadOnlyModelViewSet):
@@ -561,11 +561,6 @@ class GalleryViewSet(viewsets.ReadOnlyModelViewSet):
     queryset = GalleryItem.objects.filter(is_visible=True)
     serializer_class = GalleryItemSerializer
     permission_classes = [permissions.AllowAny]
-    
-    def list(self, request, *args, **kwargs):
-        queryset = self.get_queryset()
-        serializer = self.get_serializer(queryset, many=True)
-        return Response(serializer.data)
     
     @action(detail=False, methods=['get'])
     def latest(self, request):
@@ -580,11 +575,6 @@ class FacultyViewSet(viewsets.ReadOnlyModelViewSet):
     queryset = Faculty.objects.filter(status='active')
     serializer_class = FacultySerializer
     permission_classes = [permissions.AllowAny]
-    
-    def list(self, request, *args, **kwargs):
-        queryset = self.get_queryset()
-        serializer = self.get_serializer(queryset, many=True)
-        return Response(serializer.data)
 
 
 class ContentPageViewSet(viewsets.ReadOnlyModelViewSet):
@@ -592,11 +582,7 @@ class ContentPageViewSet(viewsets.ReadOnlyModelViewSet):
     queryset = ContentPage.objects.filter(is_published=True)
     serializer_class = ContentPageSerializer
     permission_classes = [permissions.AllowAny]
-    
-    def list(self, request, *args, **kwargs):
-        queryset = self.get_queryset()
-        serializer = self.get_serializer(queryset, many=True)
-        return Response(serializer.data)
+
 
 
 class EnquiryViewSet(viewsets.GenericViewSet):
@@ -612,32 +598,60 @@ class EnquiryViewSet(viewsets.GenericViewSet):
         return Response(serializer.data, status=status.HTTP_201_CREATED)
 
 
-class AdmissionViewSet(viewsets.GenericViewSet):
-    """Public API for Admissions - create and submit only"""
-    queryset = None
+class AdmissionViewSet(viewsets.ModelViewSet):
+    """API for Admissions - Handles both public submission and admin management"""
+    queryset = Admission.objects.all()
     serializer_class = AdmissionCreateSerializer
     permission_classes = [permissions.AllowAny]
     
+    def get_serializer_class(self):
+        if self.action == 'list':
+            return AdmissionListSerializer
+        if self.action == 'retrieve':
+            return AdmissionDetailSerializer
+        if self.action == 'complete_step':
+            return AdmissionStepSerializer
+        if self.action == 'submit':
+            return AdmissionSubmitSerializer
+        if self.action == 'transition':
+            return StateTransitionSerializer
+        if self.action == 'add_note':
+            return InternalNoteSerializer
+        return super().get_serializer_class()
+
+    def get_permissions(self):
+        # Only create and submit and status and complete_step are public
+        if self.action in ['create', 'complete_step', 'submit', 'status']:
+            return [permissions.AllowAny()]
+        # list, retrieve, transition, add_note require authentication
+        return [permissions.IsAuthenticated()]
+
+    def list(self, request, *args, **kwargs):
+        queryset = self.get_queryset()
+        page = self.paginate_queryset(queryset)
+        if page is not None:
+            serializer = self.get_serializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
+        serializer = self.get_serializer(queryset, many=True)
+        return Response(serializer.data)
+
     def create(self, request, *args, **kwargs):
-        """Create new admission"""
+        """Create new admission (Step 1)"""
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         admission = serializer.save()
         return Response({
             'id': str(admission.id),
             'application_number': admission.application_number,
+            'current_step': admission.current_step,
             'message': 'Admission created successfully'
         }, status=status.HTTP_201_CREATED)
     
     @action(detail=True, methods=['post'], url_path='complete_step')
     def complete_step(self, request, pk=None):
         """Complete a step in the admission process"""
-        try:
-            admission = self.get_object()
-        except:
-            return Response({'error': 'Admission not found'}, status=status.HTTP_404_NOT_FOUND)
-        
-        serializer = AdmissionDetailSerializer(admission, data=request.data, partial=True)
+        admission = self.get_object()
+        serializer = self.get_serializer(admission, data=request.data)
         serializer.is_valid(raise_exception=True)
         admission = serializer.save()
         
@@ -651,31 +665,22 @@ class AdmissionViewSet(viewsets.GenericViewSet):
     @action(detail=True, methods=['post'], url_path='submit')
     def submit(self, request, pk=None):
         """Submit the admission"""
-        try:
-            admission = self.get_object()
-        except:
-            return Response({'error': 'Admission not found'}, status=status.HTTP_404_NOT_FOUND)
+        admission = self.get_object()
+        serializer = self.get_serializer(admission, data=request.data)
+        serializer.is_valid(raise_exception=True)
+        admission = serializer.submit()
         
-        serializer = AdmissionSubmitSerializer()
-        try:
-            admission = serializer.submit()
-            return Response({
-                'id': str(admission.id),
-                'application_number': admission.application_number,
-                'state': admission.state,
-                'message': 'Admission submitted successfully'
-            })
-        except Exception as e:
-            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response({
+            'id': str(admission.id),
+            'application_number': admission.application_number,
+            'state': admission.state,
+            'message': 'Admission submitted successfully'
+        })
     
     @action(detail=True, methods=['get'], url_path='status')
     def status(self, request, pk=None):
         """Get admission status"""
-        try:
-            admission = self.get_object()
-        except:
-            return Response({'error': 'Admission not found'}, status=status.HTTP_404_NOT_FOUND)
-        
+        admission = self.get_object()
         return Response({
             'id': str(admission.id),
             'application_number': admission.application_number,
@@ -684,6 +689,28 @@ class AdmissionViewSet(viewsets.GenericViewSet):
             'completed_steps': admission.completed_steps,
             'submitted_at': admission.submitted_at,
         })
+
+    @action(detail=True, methods=['post'], url_path='transition')
+    def transition(self, request, pk=None):
+        """Admin transition admission state"""
+        admission = self.get_object()
+        serializer = self.get_serializer(admission, data=request.data)
+        serializer.is_valid(raise_exception=True)
+        admission = serializer.transition(admin_user=request.user)
+        return Response({
+            'id': str(admission.id),
+            'state': admission.state,
+            'message': f'Transitioned to {admission.state}'
+        })
+
+    @action(detail=True, methods=['post'], url_path='add_note')
+    def add_note(self, request, pk=None):
+        """Add an internal note to an admission"""
+        admission = self.get_object()
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        note = serializer.save(admission=admission, author=str(request.user))
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
 
 
 class WhatsAppConfigViewSet(viewsets.GenericViewSet):

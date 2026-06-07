@@ -525,9 +525,9 @@ class WhatsAppConfigSerializer(serializers.ModelSerializer):
         return attrs
 
 
-# ==============================================================================
+#=======================================================================
 # STUDENT MANAGEMENT SERIALIZERS
-# ==============================================================================
+#=======================================================================
 
 class StudentNoteSerializer(serializers.ModelSerializer):
     """Serializer for student notes"""
@@ -781,9 +781,9 @@ class StudentCreateSerializer(serializers.ModelSerializer):
         return value
 
 
-# ==============================================================================
+#=======================================================================
 # ACADEMIC CLASS/SUBJECT SERIALIZERS
-# ==============================================================================
+#=======================================================================
 
 class AcademicClassListSerializer(serializers.ModelSerializer):
     """Serializer for class/subject lists"""
