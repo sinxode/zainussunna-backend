@@ -3,6 +3,9 @@ Production Settings for Academic Admission System
 Optimized for deployment on Render.com
 """
 from .settings import *  # Import all base settings
+import os
+import random
+import string
 
 # Override security settings for production
 
@@ -23,30 +26,47 @@ CSRF_COOKIE_SECURE = True
 DEBUG = False
 
 # Generate a proper SECRET_KEY for production if not set
-import os
-import random
-import string
-
-if not SECRET_KEY or SECRET_KEY.startswith('django-insecure-'):
-    # Generate a new secure key
+if not SECRET_KEY or SECRET_KEY == 'django-insecure-dev-key-for-local-development-only-change-in-production':
     chars = string.ascii_letters + string.digits + string.punctuation
     SECRET_KEY = ''.join(random.choice(chars) for _ in range(64))
     print("⚠️  WARNING: Generated new SECRET_KEY. Set DJANGO_SECRET_KEY environment variable for persistence!")
 
-# ALLOWED_HOSTS - should be set via environment variable in production
-ALLOWED_HOSTS = os.environ.get('ALLOWED_HOSTS', '').split(',') if os.environ.get('ALLOWED_HOSTS') else [
+# ==========================================
+# FIX: Robust ALLOWED_HOSTS Parsing (Resolves 400 Bad Request)
+# ==========================================
+# If ALLOWED_HOSTS is provided via Render ENV, parse it.
+env_hosts = os.environ.get('ALLOWED_HOSTS', '')
+ALLOWED_HOSTS = [h.strip() for h in env_hosts.split(',')] if env_hosts else []
+
+# CRITICAL: Always ensure the Render domain and primary domains are permitted.
+# Note: Django uses '.domain.com' for wildcards, NOT '*.domain.com'
+required_hosts = [
     'zainussunnaacademy.com',
     'www.zainussunnaacademy.com',
     'api.zainussunnaacademy.com',
     'zainussunna-backend.onrender.com',
-    '*.onrender.com',
+    '.onrender.com', 
 ]
 
-# CORS - restrict in production
-CORS_ALLOWED_ORIGINS = os.environ.get('CORS_ALLOWED_ORIGINS', '').split(',') if os.environ.get('CORS_ALLOWED_ORIGINS') else [
+for host in required_hosts:
+    if host not in ALLOWED_HOSTS:
+        ALLOWED_HOSTS.append(host)
+
+# ==========================================
+# FIX: Robust CORS Parsing
+# ==========================================
+env_cors = os.environ.get('CORS_ALLOWED_ORIGINS', '')
+CORS_ALLOWED_ORIGINS = [origin.strip() for origin in env_cors.split(',')] if env_cors else []
+
+required_cors = [
     'https://zainussunnaacademy.com',
     'https://www.zainussunnaacademy.com',
 ]
+
+for origin in required_cors:
+    if origin not in CORS_ALLOWED_ORIGINS:
+        CORS_ALLOWED_ORIGINS.append(origin)
+
 CORS_ALLOW_ALL_ORIGINS = False
 
 # Static and Media files - use WhiteNoise
