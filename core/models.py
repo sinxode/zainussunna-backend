@@ -576,7 +576,7 @@ class GalleryItem(TimeStampedModel):
     is_visible = models.BooleanField(default=True)
     
     class Meta:
-        ordering = ['-display_order', '-created_at']
+        ordering = ['-created_at', '-display_order']
     
     def __str__(self):
         return self.title or f"Gallery item {self.id}"
