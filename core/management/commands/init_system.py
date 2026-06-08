@@ -603,7 +603,7 @@ class Command(BaseCommand):
                     'qualification': faculty_data['qualification'],
                     'bio': faculty_data['bio'],
                     'display_order': faculty_data['display_order'],
-                    'is_active': True
+                    'status': 'active'
                 }
             )
             status = 'Created' if created else 'Exists'
