@@ -47,10 +47,12 @@ urlpatterns = [
 ]
 
 # Serve media files in development AND production
+# Note: static() only works when DEBUG=True, so we add a manual re_path for production
 urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
 
-# Serve static files in production
+# Manual media and static serving for production environments (DEBUG=False)
 urlpatterns += [
+    re_path(r'^media/(?P<path>.*)$', serve, {'document_root': settings.MEDIA_ROOT}),
     re_path(r'^static/(?P<path>.*)$', serve, {'document_root': settings.STATIC_ROOT}),
 ]
 
