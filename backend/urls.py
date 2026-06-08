@@ -9,6 +9,12 @@ from django.conf.urls.static import static
 from django.views.static import serve
 from rest_framework.decorators import api_view
 from rest_framework.response import Response
+from django.http import JsonResponse
+
+
+def health_check(request):
+    """Simple health check for Render deployment"""
+    return JsonResponse({"status": "ok"})
 
 
 @api_view(['GET'])
@@ -37,6 +43,7 @@ urlpatterns = [
     path('zainussunna-admin/', admin_site.urls),
     path('api/', api_root),
     path('api/core/', include('core.urls')),
+    path('health/', health_check),
 ]
 
 # Serve media files in development AND production
