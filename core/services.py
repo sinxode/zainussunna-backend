@@ -6,7 +6,7 @@ from django.core.exceptions import ValidationError
 from .models import (
     Campaign, Student, Place, ReceiptBook, Trip, TripStudent,
     InventoryMovement, Expense, CommissionCalculation, CommissionPayout,
-    AuditLog, User, split_amount_in_paise
+    AuditLog, User, ExternalCollection, split_amount_in_paise
 )
 
 
@@ -505,6 +505,14 @@ class FinancialService:
         gpay_coll = settled_trips.aggregate(t=Sum('gpay_collection'))['t'] or Decimal('0.00')
         total_collections = cash_coll + gpay_coll
 
+        # External collections (direct contributions outside student trips)
+        external_collections = ExternalCollection.objects.filter(
+            campaign=campaign
+        ).aggregate(t=Sum('amount'))['t'] or Decimal('0.00')
+
+        # Total revenue / total received across all sources
+        total_received = total_collections + external_collections
+
         total_bus_fare = settled_trips.aggregate(t=Sum('bus_fare'))['t'] or Decimal('0.00')
         total_food_expenses = settled_trips.aggregate(t=Sum('food_expense'))['t'] or Decimal('0.00')
         total_trip_expenses = total_bus_fare + total_food_expenses
@@ -542,12 +550,12 @@ class FinancialService:
         total_commission_paid = payouts_qs.aggregate(t=Sum('amount'))['t'] or Decimal('0.00')
         outstanding_commission = total_commission_earned - total_commission_paid
 
-        # Net Profit Formula: Total collections − Total bus fare − Total food expenses − Total general expenses − Total student commission earned
-        net_profit = total_collections - total_bus_fare - total_food_expenses - total_general_expenses - total_commission_earned
+        # Net Profit Formula: Total received (student collections + external collections) − Total bus fare − Total food expenses − Total general expenses − Total student commission earned
+        net_profit = total_received - total_bus_fare - total_food_expenses - total_general_expenses - total_commission_earned
 
         # Break-even indicator
         total_expenses_with_commission = total_trip_expenses + total_general_expenses + total_commission_earned
-        break_even_recovered = min(total_collections, total_expenses_with_commission)
+        break_even_recovered = min(total_received, total_expenses_with_commission)
         break_even_percentage = (
             (break_even_recovered / total_expenses_with_commission * Decimal('100.00')).quantize(Decimal('0.1'))
             if total_expenses_with_commission > 0 else Decimal('100.0')
@@ -562,6 +570,9 @@ class FinancialService:
             'campaign_year': campaign.year,
             'campaign_status': campaign.status,
             'total_collections': total_collections,
+            'student_collections': total_collections,
+            'external_collections': external_collections,
+            'total_received': total_received,
             'cash_collections': cash_coll,
             'gpay_collections': gpay_coll,
             'total_trip_expenses': total_trip_expenses,

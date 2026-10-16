@@ -15,7 +15,7 @@ from .models import (
     User, Campaign, Student, Place, ReceiptBook,
     Trip, TripStudent, InventoryMovement, Expense,
     CommissionCalculation, CommissionPayout, AuditLog,
-    normalize_phone_number
+    ExternalCollection, normalize_phone_number
 )
 from .serializers import (
     UserSerializer, UserCreateSerializer, ChangePasswordSerializer,
@@ -25,7 +25,7 @@ from .serializers import (
     InventoryMovementSerializer, InventoryAdjustmentSerializer,
     ExpenseSerializer, ExpenseVoidSerializer,
     CommissionCalculationSerializer, CommissionPayoutSerializer,
-    AuditLogSerializer
+    AuditLogSerializer, ExternalCollectionSerializer
 )
 from .permissions import IsSuperAdmin, IsAdminUserOrSuperAdmin, IsSuperAdminOrReadOnly
 from .services import InventoryService, FinancialService, TripService, ReceiptBookService
@@ -689,6 +689,91 @@ class ExpenseViewSet(viewsets.ModelViewSet):
         )
 
         return Response(ExpenseSerializer(expense).data)
+
+
+class ExternalCollectionViewSet(viewsets.ModelViewSet):
+    queryset = ExternalCollection.objects.all().select_related('campaign', 'created_by', 'updated_by')
+    serializer_class = ExternalCollectionSerializer
+    permission_classes = [permissions.IsAuthenticated, IsAdminUserOrSuperAdmin]
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        campaign_id = self.request.query_params.get('campaign')
+        if campaign_id:
+            qs = qs.filter(campaign_id=campaign_id)
+        start_date = self.request.query_params.get('start_date')
+        if start_date:
+            qs = qs.filter(date_received__gte=start_date)
+        end_date = self.request.query_params.get('end_date')
+        if end_date:
+            qs = qs.filter(date_received__lte=end_date)
+        search = self.request.query_params.get('search')
+        if search:
+            qs = qs.filter(Q(received_from__icontains=search) | Q(notes__icontains=search))
+        return qs
+
+    def perform_create(self, serializer):
+        with transaction.atomic():
+            ext_coll = serializer.save(created_by=self.request.user)
+            AuditLog.objects.create(
+                user=self.request.user,
+                action='external_collection_create',
+                entity_type='ExternalCollection',
+                entity_id=str(ext_coll.id),
+                after_snapshot={
+                    'campaign_id': ext_coll.campaign_id,
+                    'received_from': ext_coll.received_from,
+                    'amount': str(ext_coll.amount),
+                    'date_received': str(ext_coll.date_received),
+                    'notes': ext_coll.notes,
+                },
+                reason=f"External collection of ₹{ext_coll.amount} received from {ext_coll.received_from}"
+            )
+
+    def perform_update(self, serializer):
+        with transaction.atomic():
+            instance = self.get_object()
+            before_snapshot = {
+                'campaign_id': instance.campaign_id,
+                'received_from': instance.received_from,
+                'amount': str(instance.amount),
+                'date_received': str(instance.date_received),
+                'notes': instance.notes,
+            }
+            updated = serializer.save(updated_by=self.request.user)
+            AuditLog.objects.create(
+                user=self.request.user,
+                action='external_collection_update',
+                entity_type='ExternalCollection',
+                entity_id=str(updated.id),
+                before_snapshot=before_snapshot,
+                after_snapshot={
+                    'campaign_id': updated.campaign_id,
+                    'received_from': updated.received_from,
+                    'amount': str(updated.amount),
+                    'date_received': str(updated.date_received),
+                    'notes': updated.notes,
+                },
+                reason=f"Corrected external collection #{updated.id}"
+            )
+
+    def perform_destroy(self, instance):
+        with transaction.atomic():
+            AuditLog.objects.create(
+                user=self.request.user,
+                action='external_collection_delete',
+                entity_type='ExternalCollection',
+                entity_id=str(instance.id),
+                before_snapshot={
+                    'campaign_id': instance.campaign_id,
+                    'received_from': instance.received_from,
+                    'amount': str(instance.amount),
+                    'date_received': str(instance.date_received),
+                    'notes': instance.notes,
+                },
+                reason=f"Deleted external collection #{instance.id} from {instance.received_from}"
+            )
+            instance.delete()
 
 
 # --- Commission Views ---

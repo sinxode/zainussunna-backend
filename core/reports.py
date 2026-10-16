@@ -11,7 +11,10 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, Tabl
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib import colors
 
-from .models import Campaign, Student, Place, ReceiptBook, Trip, TripStudent, Expense, CommissionCalculation, CommissionPayout
+from .models import (
+    Campaign, Student, Place, ReceiptBook, Trip, TripStudent,
+    Expense, CommissionCalculation, CommissionPayout, ExternalCollection
+)
 from .services import FinancialService, InventoryService
 
 
@@ -63,9 +66,11 @@ class ReportGenerator:
             ["Calendars Currently in Field", inv['calendars_in_field'], "On active trips"],
             ["Calendars Returned Unsold", inv['calendars_returned'], "Safely returned to inventory"],
             ["Available Stock in Hand", inv['available_stock'], "Printed - Sold - In Field + Adjustments"],
-            ["Total Collections", float(fin['total_collections']), "Cash + Google Pay"],
-            ["  - Cash Collections", float(fin['cash_collections']), ""],
-            ["  - Google Pay / UPI", float(fin['gpay_collections']), ""],
+            ["Total Campaign Received", float(fin['total_received']), "Student collections + External direct collections"],
+            ["  - Student Trip Collections", float(fin['total_collections']), "Cash + Google Pay from settled trips"],
+            ["    * Cash Collections", float(fin['cash_collections']), ""],
+            ["    * Google Pay / UPI", float(fin['gpay_collections']), ""],
+            ["  - External Collections", float(fin['external_collections']), "Direct contributions outside trips"],
             ["Total Trip Expenses", float(fin['total_trip_expenses']), "Bus fare + Food expenses"],
             ["  - Bus Fare Advanced", float(fin['bus_fare']), ""],
             ["  - Food Expenses", float(fin['food_expense']), ""],
@@ -74,7 +79,7 @@ class ReportGenerator:
             ["Total Commission Earned", float(fin['total_commission_earned']), f"{campaign.commission_percentage}% on student net collection"],
             ["Total Commission Paid", float(fin['total_commission_paid']), "Actual disbursements recorded"],
             ["Outstanding Commission Payable", float(fin['outstanding_commission']), ""],
-            ["Net Campaign Profit", float(fin['net_profit']), "Collections - Trip Expenses - General Expenses - Commission Earned"],
+            ["Net Campaign Profit", float(fin['net_profit']), "Total Received - Trip Expenses - General Expenses - Commission Earned"],
             ["Completed / Settled Trips", fin['settled_trips_count'], ""],
             ["Active Trips in Progress", fin['open_trips_count'], ""],
             ["Trips Requiring Review", fin['review_trips_count'], ""],
@@ -88,7 +93,7 @@ class ReportGenerator:
                     cell = ws_sum.cell(row=row_idx, column=col_idx)
                     cell.fill = header_fill
                     cell.font = header_font
-            elif "Profit" in str(row[0]) or "Total Collections" in str(row[0]):
+            elif "Profit" in str(row[0]) or "Total Collections" in str(row[0]) or "Total Campaign Received" in str(row[0]):
                 for col_idx in range(1, 4):
                     cell = ws_sum.cell(row=row_idx, column=col_idx)
                     cell.fill = total_fill
@@ -159,6 +164,22 @@ class ReportGenerator:
                 e.id, e.category, float(e.amount), str(e.date), e.description, "YES" if e.is_voided else "NO"
             ])
 
+        # Sheet 5: External Collections
+        ws_ext = wb.create_sheet(title="External Collections")
+        ext_headers = ["ID", "Received From", "Amount (₹)", "Date Received", "Notes", "Recorded By"]
+        ws_ext.append(ext_headers)
+        for col_idx in range(1, len(ext_headers) + 1):
+            cell = ws_ext.cell(row=1, column=col_idx)
+            cell.fill = header_fill
+            cell.font = header_font
+
+        ext_colls = ExternalCollection.objects.filter(campaign=campaign).select_related('created_by')
+        for ec in ext_colls:
+            ws_ext.append([
+                ec.id, ec.received_from, float(ec.amount), str(ec.date_received), ec.notes,
+                ec.created_by.display_name if ec.created_by else ""
+            ])
+
         # Auto-adjust column widths
         for ws in wb.worksheets:
             for col in ws.columns:
@@ -221,6 +242,15 @@ class ReportGenerator:
                         calc.rate, calc.calculated_commission, paid, rem
                     ])
             filename = f"Zainussunna_Students_{campaign.year}.csv"
+
+        elif report_type == 'external_collections':
+            writer.writerow(["ID", "Received From", "Amount", "Date Received", "Notes", "Recorded By"])
+            for ec in ExternalCollection.objects.filter(campaign=campaign).select_related('created_by'):
+                writer.writerow([
+                    ec.id, ec.received_from, ec.amount, ec.date_received, ec.notes,
+                    ec.created_by.display_name if ec.created_by else ""
+                ])
+            filename = f"Zainussunna_External_Collections_{campaign.year}.csv"
 
         else:  # expenses
             writer.writerow(["Expense ID", "Category", "Amount", "Date", "Description", "Is Voided"])
@@ -295,15 +325,16 @@ class ReportGenerator:
         # Summary Table
         summary_data = [
             ["Metric", "Value", "Metric", "Value"],
-            ["Total Calendars Printed", str(inv['printed_quantity']), "Total Collections (₹)", f"₹{fin['total_collections']:,.2f}"],
-            ["Calendars Sold", str(inv['calendars_sold']), "  - Cash Collections (₹)", f"₹{fin['cash_collections']:,.2f}"],
-            ["Calendars in Field", str(inv['calendars_in_field']), "  - GPay / UPI Collections (₹)", f"₹{fin['gpay_collections']:,.2f}"],
-            ["Calendars Returned Unsold", str(inv['calendars_returned']), "Total Trip Expenses (₹)", f"₹{fin['total_trip_expenses']:,.2f}"],
-            ["Stock Available in Hand", str(inv['available_stock']), "General Expenses (₹)", f"₹{fin['general_expenses']:,.2f}"],
-            ["Settled Trips", str(fin['settled_trips_count']), "Printing Cost (₹)", f"₹{fin['printing_expense']:,.2f}"],
-            ["Active Trips", str(fin['open_trips_count']), "Total Commission Earned (₹)", f"₹{fin['total_commission_earned']:,.2f}"],
-            ["Trips Needing Review", str(fin['review_trips_count']), "Commission Paid (₹)", f"₹{fin['total_commission_paid']:,.2f}"],
-            ["Break-Even Progress", f"{fin['break_even_percentage']}%", "Outstanding Commission (₹)", f"₹{fin['outstanding_commission']:,.2f}"],
+            ["Total Calendars Printed", str(inv['printed_quantity']), "Total Received (All Sources)", f"₹{fin['total_received']:,.2f}"],
+            ["Calendars Sold", str(inv['calendars_sold']), "  - Student Collections", f"₹{fin['total_collections']:,.2f}"],
+            ["Calendars in Field", str(inv['calendars_in_field']), "    * Cash Collections", f"₹{fin['cash_collections']:,.2f}"],
+            ["Calendars Returned Unsold", str(inv['calendars_returned']), "    * GPay / UPI Collections", f"₹{fin['gpay_collections']:,.2f}"],
+            ["Stock Available in Hand", str(inv['available_stock']), "  - External Collections", f"₹{fin['external_collections']:,.2f}"],
+            ["Settled Trips", str(fin['settled_trips_count']), "Total Trip Expenses (₹)", f"₹{fin['total_trip_expenses']:,.2f}"],
+            ["Active Trips", str(fin['open_trips_count']), "General Expenses (₹)", f"₹{fin['general_expenses']:,.2f}"],
+            ["Trips Needing Review", str(fin['review_trips_count']), "Printing Cost (₹)", f"₹{fin['printing_expense']:,.2f}"],
+            ["Break-Even Progress", f"{fin['break_even_percentage']}%", "Total Commission Earned (₹)", f"₹{fin['total_commission_earned']:,.2f}"],
+            ["Commission Paid (₹)", f"₹{fin['total_commission_paid']:,.2f}", "Outstanding Commission (₹)", f"₹{fin['outstanding_commission']:,.2f}"],
             ["", "", "Net Campaign Profit (₹)", f"₹{fin['net_profit']:,.2f}"],
         ]
 
@@ -350,6 +381,34 @@ class ReportGenerator:
             elements.append(t_trips)
         else:
             elements.append(Paragraph("No settled trips recorded yet.", cell_style))
+
+        elements.append(Spacer(1, 14))
+
+        # External Collections Section
+        elements.append(Paragraph("External Collections (Direct Contributions)", section_style))
+        ext_table_data = [["#", "Date Received", "Received From", "Amount (₹)", "Recorded By", "Notes"]]
+        ext_colls = ExternalCollection.objects.filter(campaign=campaign).select_related('created_by')[:20]
+        for ec in ext_colls:
+            ext_table_data.append([
+                f"#{ec.id}", str(ec.date_received), ec.received_from[:25],
+                f"₹{ec.amount:,.2f}", ec.created_by.display_name if ec.created_by else "-",
+                ec.notes[:30] or "-"
+            ])
+
+        if len(ext_table_data) > 1:
+            t_ext = Table(ext_table_data, colWidths=[30, 70, 140, 80, 90, 110])
+            t_ext.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#374151')),
+                ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                ('FONTSIZE', (0, 0), (-1, -1), 7),
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 3),
+                ('TOPPADDING', (0, 0), (-1, -1), 3),
+                ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#E5E7EB')),
+            ]))
+            elements.append(t_ext)
+        else:
+            elements.append(Paragraph("No external collections recorded yet.", cell_style))
 
         elements.append(Spacer(1, 14))
 

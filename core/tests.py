@@ -7,7 +7,7 @@ from rest_framework.test import APIClient
 from .models import (
     User, Campaign, Student, Place, ReceiptBook,
     Trip, TripStudent, InventoryMovement, Expense,
-    CommissionCalculation, CommissionPayout,
+    CommissionCalculation, CommissionPayout, AuditLog, ExternalCollection,
     normalize_phone_number, split_amount_in_paise
 )
 from .services import InventoryService, TripService, FinancialService, ReceiptBookService
@@ -1087,4 +1087,269 @@ class FinancialRulesAndOperationsTestCase(TestCase):
         self.campaign.refresh_from_db()
         self.assertEqual(self.campaign.status, 'active')
         self.assertIsNone(self.campaign.closed_at)
+
+    def test_external_collection_creation_and_audit(self):
+        """Verify adding an external collection records user, timestamp, and audit trail."""
+        client = APIClient()
+        client.force_authenticate(user=self.admin_user)
+        url = "/api/v1/external-collections/"
+        payload = {
+            'campaign': self.campaign.id,
+            'received_from': 'Haji Usman',
+            'amount': '5000.00',
+            'date_received': '2026-10-15',
+            'notes': 'Direct well-wisher sponsorship'
+        }
+        res = client.post(url, payload, format='json')
+        self.assertEqual(res.status_code, 201)
+        self.assertEqual(res.data['received_from'], 'Haji Usman')
+        self.assertEqual(res.data['amount'], '5000.00')
+        self.assertEqual(res.data['created_by'], self.admin_user.id)
+        self.assertEqual(res.data['created_by_name'], self.admin_user.display_name)
+        self.assertIsNotNone(res.data['created_at'])
+
+        # Check AuditLog
+        log = AuditLog.objects.filter(
+            action='external_collection_create',
+            entity_type='ExternalCollection',
+            entity_id=str(res.data['id'])
+        ).first()
+        self.assertIsNotNone(log)
+        self.assertEqual(log.user, self.admin_user)
+        self.assertEqual(log.after_snapshot['received_from'], 'Haji Usman')
+        self.assertEqual(log.after_snapshot['amount'], '5000.00')
+
+    def test_external_collection_validation(self):
+        """Verify validation rules on amount, recipient name, and campaign state."""
+        client = APIClient()
+        client.force_authenticate(user=self.admin_user)
+        url = "/api/v1/external-collections/"
+
+        # Negative amount
+        res_neg = client.post(url, {
+            'campaign': self.campaign.id,
+            'received_from': 'Donor A',
+            'amount': '-500.00',
+            'date_received': '2026-10-15'
+        }, format='json')
+        self.assertEqual(res_neg.status_code, 400)
+        self.assertIn("must be greater than zero", str(res_neg.data))
+
+        # Zero amount
+        res_zero = client.post(url, {
+            'campaign': self.campaign.id,
+            'received_from': 'Donor A',
+            'amount': '0.00',
+            'date_received': '2026-10-15'
+        }, format='json')
+        self.assertEqual(res_zero.status_code, 400)
+        self.assertIn("must be greater than zero", str(res_zero.data))
+
+        # Empty received_from
+        res_empty = client.post(url, {
+            'campaign': self.campaign.id,
+            'received_from': '   ',
+            'amount': '1000.00',
+            'date_received': '2026-10-15'
+        }, format='json')
+        self.assertEqual(res_empty.status_code, 400)
+        self.assertTrue('received_from' in res_empty.data)
+
+        # Closed campaign
+        self.campaign.status = 'closed'
+        self.campaign.save()
+        res_closed = client.post(url, {
+            'campaign': self.campaign.id,
+            'received_from': 'Donor B',
+            'amount': '1000.00',
+            'date_received': '2026-10-15'
+        }, format='json')
+        self.assertEqual(res_closed.status_code, 400)
+        self.assertIn("closed campaign", str(res_closed.data))
+
+    def test_external_collection_update_and_audit(self):
+        """Verify editing/correcting an external collection records updater and audit trail."""
+        ec = ExternalCollection.objects.create(
+            campaign=self.campaign,
+            received_from='Original Name',
+            amount=Decimal('2500.00'),
+            date_received=timezone.now().date(),
+            created_by=self.superadmin
+        )
+        client = APIClient()
+        client.force_authenticate(user=self.admin_user)
+        url = f"/api/v1/external-collections/{ec.id}/"
+        res = client.patch(url, {
+            'received_from': 'Corrected Name',
+            'amount': '3000.00',
+            'notes': 'Typo corrected'
+        }, format='json')
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.data['received_from'], 'Corrected Name')
+        self.assertEqual(res.data['amount'], '3000.00')
+
+        ec.refresh_from_db()
+        self.assertEqual(ec.updated_by, self.admin_user)
+        self.assertEqual(ec.amount, Decimal('3000.00'))
+
+        log = AuditLog.objects.filter(
+            action='external_collection_update',
+            entity_type='ExternalCollection',
+            entity_id=str(ec.id)
+        ).first()
+        self.assertIsNotNone(log)
+        self.assertEqual(log.user, self.admin_user)
+        self.assertEqual(log.before_snapshot['received_from'], 'Original Name')
+        self.assertEqual(log.after_snapshot['received_from'], 'Corrected Name')
+
+    def test_external_collection_permissions(self):
+        """Verify only authenticated administrators can create and access external collections."""
+        client = APIClient()
+        url = "/api/v1/external-collections/"
+
+        # Unauthenticated
+        res_unauth = client.get(url)
+        self.assertEqual(res_unauth.status_code, 401)
+
+        # Authenticated as normal non-admin user
+        normal_user = User.objects.create_user(
+            phone_number='9999999999',
+            password='NormalUserPass123!',
+            display_name='Regular User',
+            role='viewer',
+            is_staff=False
+        )
+        client.force_authenticate(user=normal_user)
+        res_forbidden = client.get(url)
+        self.assertEqual(res_forbidden.status_code, 403)
+
+    def test_external_collection_campaign_isolation(self):
+        """Verify external collections are strictly isolated by campaign."""
+        campaign_2027 = Campaign.objects.create(
+            name='Calendar Fund 2027',
+            year=2027,
+            printed_quantity=2500,
+            cost_price_per_calendar=Decimal('12.00'),
+            min_expected_collection_per_calendar=Decimal('25.00'),
+            commission_percentage=Decimal('10.00'),
+            created_by=self.superadmin,
+        )
+        ec_2026 = ExternalCollection.objects.create(
+            campaign=self.campaign,
+            received_from='2026 Contributor',
+            amount=Decimal('4000.00'),
+            date_received=timezone.now().date(),
+            created_by=self.superadmin
+        )
+        ec_2027 = ExternalCollection.objects.create(
+            campaign=campaign_2027,
+            received_from='2027 Contributor',
+            amount=Decimal('8000.00'),
+            date_received=timezone.now().date(),
+            created_by=self.superadmin
+        )
+
+        client = APIClient()
+        client.force_authenticate(user=self.admin_user)
+
+        res_2026 = client.get(f"/api/v1/external-collections/?campaign={self.campaign.id}")
+        self.assertEqual(res_2026.status_code, 200)
+        items_2026 = res_2026.data.get('results', res_2026.data)
+        self.assertEqual(len(items_2026), 1)
+        self.assertEqual(items_2026[0]['id'], ec_2026.id)
+
+        res_2027 = client.get(f"/api/v1/external-collections/?campaign={campaign_2027.id}")
+        self.assertEqual(res_2027.status_code, 200)
+        items_2027 = res_2027.data.get('results', res_2027.data)
+        self.assertEqual(len(items_2027), 1)
+        self.assertEqual(items_2027[0]['id'], ec_2027.id)
+
+    def test_external_collection_financial_reporting_and_exclusion_from_commission(self):
+        """
+        Verify external collections are included in campaign total-received and net profit,
+        while strictly excluded from student trip collections, student net, and student commission.
+        """
+        # 1. Dispatch and settle a trip with 2 students
+        trip = TripService.dispatch_trip(
+            campaign=self.campaign,
+            place=self.place1,
+            trip_date=timezone.now().date(),
+            departure_time='09:00:00',
+            student_ids=[self.student_a.id, self.student_b.id],
+            calendars_issued=100,
+            receipt_book=self.receipt_book,
+            receipt_starting_leaf=1,
+            bus_fare=Decimal('600.00'),
+            notes='',
+            user=self.superadmin
+        )
+
+        TripService.settle_trip(
+            trip=trip,
+            return_time='17:00:00',
+            calendars_sold=80,
+            calendars_returned=20,
+            cash_collection=Decimal('5000.00'),
+            gpay_collection=Decimal('5000.00'),
+            food_expense=Decimal('400.00'),
+            receipt_book=self.receipt_book,
+            receipt_starting_leaf=1,
+            receipt_ending_leaf=80,
+            voided_leaves='',
+            discrepancy_notes='',
+            user=self.superadmin
+        )
+
+        # Before external collection:
+        # Trip collections = 10,000 (Cash 5000 + GPay 5000)
+        # Deductions = 600 (fare) + 400 (food) = 1000
+        # Student A: Gross 5000, Fare 300, Food 200, Net 4500, Comm 450
+        # Student B: Gross 5000, Fare 300, Food 200, Net 4500, Comm 450
+        # Total Commission = 900
+        calc_a_before = FinancialService.recalculate_student_commission(self.campaign, self.student_a)
+        self.assertEqual(calc_a_before.gross_collection, Decimal('5000.00'))
+        self.assertEqual(calc_a_before.net_collection, Decimal('4500.00'))
+        self.assertEqual(calc_a_before.calculated_commission, Decimal('450.00'))
+
+        summary_before = FinancialService.get_campaign_financial_summary(self.campaign)
+        self.assertEqual(summary_before['student_collections'], Decimal('10000.00'))
+        self.assertEqual(summary_before['external_collections'], Decimal('0.00'))
+        self.assertEqual(summary_before['total_received'], Decimal('10000.00'))
+        self.assertEqual(summary_before['total_commission_earned'], Decimal('900.00'))
+
+        # 2. Now add an External Collection of ₹50,000
+        ec = ExternalCollection.objects.create(
+            campaign=self.campaign,
+            received_from='Generous Patron',
+            amount=Decimal('50000.00'),
+            date_received=timezone.now().date(),
+            notes='Patron donation to campaign',
+            created_by=self.superadmin
+        )
+
+        # 3. Recalculate student commissions and verify ZERO change
+        calc_a_after = FinancialService.recalculate_student_commission(self.campaign, self.student_a)
+        self.assertEqual(calc_a_after.gross_collection, Decimal('5000.00'))
+        self.assertEqual(calc_a_after.fare_share, Decimal('300.00'))
+        self.assertEqual(calc_a_after.food_share, Decimal('200.00'))
+        self.assertEqual(calc_a_after.net_collection, Decimal('4500.00'))
+        self.assertEqual(calc_a_after.calculated_commission, Decimal('450.00'))
+
+        calc_b_after = FinancialService.recalculate_student_commission(self.campaign, self.student_b)
+        self.assertEqual(calc_b_after.calculated_commission, Decimal('450.00'))
+
+        # 4. Check campaign financial summary
+        summary_after = FinancialService.get_campaign_financial_summary(self.campaign)
+        # Student collections must remain exactly 10,000
+        self.assertEqual(summary_after['student_collections'], Decimal('10000.00'))
+        self.assertEqual(summary_after['total_collections'], Decimal('10000.00'))
+        # External collections must be 50,000
+        self.assertEqual(summary_after['external_collections'], Decimal('50000.00'))
+        # Total received must be exactly 60,000 (no double counting)
+        self.assertEqual(summary_after['total_received'], Decimal('60000.00'))
+        # Commission must still be 900
+        self.assertEqual(summary_after['total_commission_earned'], Decimal('900.00'))
+        # Net profit = 60,000 - 600 - 400 - 0 (general) - 900 = 58,100
+        expected_net_profit = Decimal('60000.00') - Decimal('600.00') - Decimal('400.00') - Decimal('900.00')
+        self.assertEqual(summary_after['net_profit'], expected_net_profit)
 

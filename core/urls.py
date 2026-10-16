@@ -6,7 +6,8 @@ from .views import (
     UserViewSet, CampaignViewSet, StudentViewSet, PlaceViewSet,
     ReceiptBookViewSet, TripViewSet,
     InventorySummaryView, InventoryMovementViewSet, InventoryAdjustmentView,
-    ExpenseViewSet, CommissionSummaryView, CommissionFinalizeView,
+    ExpenseViewSet, ExternalCollectionViewSet,
+    CommissionSummaryView, CommissionFinalizeView,
     CommissionPayoutViewSet, ReportSummaryView, ReportExportView,
     AuditLogViewSet
 )
@@ -20,6 +21,7 @@ router.register(r'receipt-books', ReceiptBookViewSet, basename='receipt-book')
 router.register(r'trips', TripViewSet, basename='trip')
 router.register(r'inventory/movements', InventoryMovementViewSet, basename='inventory-movement')
 router.register(r'expenses', ExpenseViewSet, basename='expense')
+router.register(r'external-collections', ExternalCollectionViewSet, basename='external-collection')
 router.register(r'commission/payouts', CommissionPayoutViewSet, basename='commission-payout')
 router.register(r'audit-logs', AuditLogViewSet, basename='audit-log')
 

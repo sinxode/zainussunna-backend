@@ -6,7 +6,7 @@ from .models import (
     User, Campaign, Student, Place, ReceiptBook,
     Trip, TripStudent, InventoryMovement, Expense,
     CommissionCalculation, CommissionPayout, AuditLog,
-    normalize_phone_number
+    ExternalCollection, normalize_phone_number
 )
 from .services import InventoryService, FinancialService, ReceiptBookService
 
@@ -317,3 +317,41 @@ class AuditLogSerializer(serializers.ModelSerializer):
             'reason', 'timestamp'
         ]
         read_only_fields = fields
+
+
+class ExternalCollectionSerializer(serializers.ModelSerializer):
+    created_by_name = serializers.CharField(source='created_by.display_name', read_only=True)
+    updated_by_name = serializers.CharField(source='updated_by.display_name', read_only=True)
+    campaign_year = serializers.IntegerField(source='campaign.year', read_only=True)
+
+    class Meta:
+        model = ExternalCollection
+        fields = [
+            'id', 'campaign', 'campaign_year', 'received_from',
+            'amount', 'date_received', 'notes',
+            'created_by', 'created_by_name',
+            'updated_by', 'updated_by_name',
+            'created_at', 'updated_at'
+        ]
+        read_only_fields = [
+            'id', 'created_by', 'created_by_name',
+            'updated_by', 'updated_by_name',
+            'created_at', 'updated_at'
+        ]
+
+    def validate_amount(self, value):
+        if value <= Decimal('0.00'):
+            raise serializers.ValidationError("Amount must be greater than zero.")
+        return value
+
+    def validate_received_from(self, value):
+        val = value.strip()
+        if not val:
+            raise serializers.ValidationError("Person name (received from) is required.")
+        return val
+
+    def validate(self, attrs):
+        campaign = attrs.get('campaign') or (self.instance.campaign if self.instance else None)
+        if campaign and campaign.status == 'closed':
+            raise serializers.ValidationError("Cannot add or modify external collections in a closed campaign.")
+        return attrs

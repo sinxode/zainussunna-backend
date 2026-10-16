@@ -374,3 +374,25 @@ class AuditLog(models.Model):
 
     def __str__(self):
         return f"{self.action} on {self.entity_type} #{self.entity_id} at {self.timestamp}"
+
+
+class ExternalCollection(models.Model):
+    """
+    Direct financial collections received from individuals outside student-collected receipt books.
+    Strictly isolated from student trip collections and student commission calculations.
+    """
+    campaign = models.ForeignKey(Campaign, on_delete=models.CASCADE, related_name='external_collections')
+    received_from = models.CharField(max_length=255, db_index=True)
+    amount = models.DecimalField(max_digits=10, decimal_places=2)
+    date_received = models.DateField(default=timezone.now, db_index=True)
+    notes = models.TextField(blank=True, default='')
+    created_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='external_collections_created')
+    updated_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='external_collections_updated')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-date_received', '-created_at']
+
+    def __str__(self):
+        return f"External Collection from {self.received_from}: ₹{self.amount} ({self.date_received})"

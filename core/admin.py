@@ -2,7 +2,7 @@ from django.contrib import admin
 from .models import (
     User, Campaign, Student, Place, ReceiptBook,
     Trip, TripStudent, InventoryMovement, Expense,
-    CommissionCalculation, CommissionPayout, AuditLog
+    CommissionCalculation, CommissionPayout, AuditLog, ExternalCollection
 )
 
 @admin.register(User)
@@ -64,3 +64,9 @@ class CommissionPayoutAdmin(admin.ModelAdmin):
 class AuditLogAdmin(admin.ModelAdmin):
     list_display = ('timestamp', 'user', 'action', 'entity_type', 'entity_id')
     list_filter = ('action', 'entity_type')
+
+@admin.register(ExternalCollection)
+class ExternalCollectionAdmin(admin.ModelAdmin):
+    list_display = ('received_from', 'amount', 'campaign', 'date_received', 'created_by')
+    list_filter = ('campaign', 'date_received')
+    search_fields = ('received_from', 'notes')
