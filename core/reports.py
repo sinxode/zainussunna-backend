@@ -166,7 +166,7 @@ class ReportGenerator:
 
         # Sheet 5: External Collections
         ws_ext = wb.create_sheet(title="External Collections")
-        ext_headers = ["ID", "Received From", "Amount (₹)", "Date Received", "Notes", "Recorded By"]
+        ext_headers = ["ID", "Received From", "Amount (₹)", "Calendars Given", "Date Received", "Notes", "Recorded By"]
         ws_ext.append(ext_headers)
         for col_idx in range(1, len(ext_headers) + 1):
             cell = ws_ext.cell(row=1, column=col_idx)
@@ -176,7 +176,7 @@ class ReportGenerator:
         ext_colls = ExternalCollection.objects.filter(campaign=campaign).select_related('created_by')
         for ec in ext_colls:
             ws_ext.append([
-                ec.id, ec.received_from, float(ec.amount), str(ec.date_received), ec.notes,
+                ec.id, ec.received_from, float(ec.amount), ec.calendars_given, str(ec.date_received), ec.notes,
                 ec.created_by.display_name if ec.created_by else ""
             ])
 
@@ -244,10 +244,10 @@ class ReportGenerator:
             filename = f"Zainussunna_Students_{campaign.year}.csv"
 
         elif report_type == 'external_collections':
-            writer.writerow(["ID", "Received From", "Amount", "Date Received", "Notes", "Recorded By"])
+            writer.writerow(["ID", "Received From", "Amount", "Calendars Given", "Date Received", "Notes", "Recorded By"])
             for ec in ExternalCollection.objects.filter(campaign=campaign).select_related('created_by'):
                 writer.writerow([
-                    ec.id, ec.received_from, ec.amount, ec.date_received, ec.notes,
+                    ec.id, ec.received_from, ec.amount, ec.calendars_given, ec.date_received, ec.notes,
                     ec.created_by.display_name if ec.created_by else ""
                 ])
             filename = f"Zainussunna_External_Collections_{campaign.year}.csv"
@@ -386,17 +386,17 @@ class ReportGenerator:
 
         # External Collections Section
         elements.append(Paragraph("External Collections (Direct Contributions)", section_style))
-        ext_table_data = [["#", "Date Received", "Received From", "Amount (₹)", "Recorded By", "Notes"]]
+        ext_table_data = [["#", "Date", "Received From", "Amount (₹)", "Calendars", "Recorded By", "Notes"]]
         ext_colls = ExternalCollection.objects.filter(campaign=campaign).select_related('created_by')[:20]
         for ec in ext_colls:
             ext_table_data.append([
-                f"#{ec.id}", str(ec.date_received), ec.received_from[:25],
-                f"₹{ec.amount:,.2f}", ec.created_by.display_name if ec.created_by else "-",
-                ec.notes[:30] or "-"
+                f"#{ec.id}", str(ec.date_received), ec.received_from[:22],
+                f"₹{ec.amount:,.2f}", str(ec.calendars_given), ec.created_by.display_name if ec.created_by else "-",
+                ec.notes[:20] or "-"
             ])
 
         if len(ext_table_data) > 1:
-            t_ext = Table(ext_table_data, colWidths=[30, 70, 140, 80, 90, 110])
+            t_ext = Table(ext_table_data, colWidths=[25, 65, 120, 75, 55, 85, 95])
             t_ext.setStyle(TableStyle([
                 ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#374151')),
                 ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),

@@ -384,6 +384,7 @@ class ExternalCollection(models.Model):
     campaign = models.ForeignKey(Campaign, on_delete=models.CASCADE, related_name='external_collections')
     received_from = models.CharField(max_length=255, db_index=True)
     amount = models.DecimalField(max_digits=10, decimal_places=2)
+    calendars_given = models.PositiveIntegerField(default=0)
     date_received = models.DateField(default=timezone.now, db_index=True)
     notes = models.TextField(blank=True, default='')
     created_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='external_collections_created')

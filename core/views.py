@@ -2,6 +2,7 @@ from decimal import Decimal
 from django.utils import timezone
 from django.db import transaction
 from django.db.models import Sum, Q, Count
+from django.core.exceptions import ValidationError
 from rest_framework import viewsets, status, generics, permissions
 from rest_framework.views import APIView
 from rest_framework.renderers import BaseRenderer, JSONRenderer
@@ -565,6 +566,17 @@ class TripViewSet(viewsets.ModelViewSet):
         )
         return Response(TripSerializer(trip).data)
 
+    def destroy(self, request, *args, **kwargs):
+        """Permanently delete a trip with inventory and commission reconciliation."""
+        trip = self.get_object()
+        try:
+            TripService.delete_trip(trip, request.user)
+            return Response(status=status.HTTP_204_NO_CONTENT)
+        except ValidationError as e:
+            return Response({'error': str(e.message if hasattr(e, 'message') else e)}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
 
 # --- Inventory Views ---
 
@@ -724,10 +736,11 @@ class ExternalCollectionViewSet(viewsets.ModelViewSet):
                     'campaign_id': ext_coll.campaign_id,
                     'received_from': ext_coll.received_from,
                     'amount': str(ext_coll.amount),
+                    'calendars_given': ext_coll.calendars_given,
                     'date_received': str(ext_coll.date_received),
                     'notes': ext_coll.notes,
                 },
-                reason=f"External collection of ₹{ext_coll.amount} received from {ext_coll.received_from}"
+                reason=f"External collection of ₹{ext_coll.amount} ({ext_coll.calendars_given} calendars given) received from {ext_coll.received_from}"
             )
 
     def perform_update(self, serializer):
@@ -737,6 +750,7 @@ class ExternalCollectionViewSet(viewsets.ModelViewSet):
                 'campaign_id': instance.campaign_id,
                 'received_from': instance.received_from,
                 'amount': str(instance.amount),
+                'calendars_given': instance.calendars_given,
                 'date_received': str(instance.date_received),
                 'notes': instance.notes,
             }
@@ -751,6 +765,7 @@ class ExternalCollectionViewSet(viewsets.ModelViewSet):
                     'campaign_id': updated.campaign_id,
                     'received_from': updated.received_from,
                     'amount': str(updated.amount),
+                    'calendars_given': updated.calendars_given,
                     'date_received': str(updated.date_received),
                     'notes': updated.notes,
                 },
@@ -768,6 +783,7 @@ class ExternalCollectionViewSet(viewsets.ModelViewSet):
                     'campaign_id': instance.campaign_id,
                     'received_from': instance.received_from,
                     'amount': str(instance.amount),
+                    'calendars_given': instance.calendars_given,
                     'date_received': str(instance.date_received),
                     'notes': instance.notes,
                 },

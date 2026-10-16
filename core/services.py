@@ -41,14 +41,20 @@ class InventoryService:
             movement_type='adjustment'
         ).aggregate(total=Sum('quantity'))['total'] or 0
 
+        # Calendars given via external collections
+        external_calendars = ExternalCollection.objects.filter(
+            campaign=campaign
+        ).aggregate(total=Sum('calendars_given'))['total'] or 0
+
         printed = campaign.printed_quantity
-        available = printed - sold - in_field + adjustments
+        available = printed - sold - in_field - external_calendars + adjustments
 
         return {
             'printed_quantity': printed,
             'calendars_sold': sold,
             'calendars_in_field': in_field,
             'calendars_returned': returned,
+            'calendars_external': external_calendars,
             'adjustments': adjustments,
             'available_stock': available,
         }
@@ -439,6 +445,67 @@ class TripService:
             )
 
             return trip
+
+    @staticmethod
+    def delete_trip(trip: Trip, user: User | None) -> None:
+        """
+        Permanently delete a trip with full financial integrity:
+        - Reverses inventory deductions and restores available stock.
+        - Removes trip participation shares.
+        - Recalculates commissions for affected students if trip was settled.
+        - Deletes associated expenses and inventory movements.
+        - Prevents deletion if campaign is closed.
+        - Records an immutable audit log snapshot.
+        """
+        with transaction.atomic():
+            trip = Trip.objects.select_for_update().get(id=trip.id)
+            if trip.campaign.status == 'closed':
+                raise ValidationError("Cannot delete trips belonging to a closed campaign.")
+
+            trip_id = trip.id
+            campaign = trip.campaign
+            status_val = trip.status
+            students = [ts.student for ts in trip.trip_students.select_related('student').all()]
+
+            before_snapshot = {
+                'id': trip_id,
+                'campaign_id': campaign.id,
+                'place': trip.place.name if trip.place else None,
+                'status': status_val,
+                'trip_date': str(trip.trip_date),
+                'calendars_issued': trip.calendars_issued,
+                'calendars_sold': trip.calendars_sold,
+                'calendars_returned': trip.calendars_returned,
+                'cash_collection': str(trip.cash_collection),
+                'gpay_collection': str(trip.gpay_collection),
+                'bus_fare': str(trip.bus_fare),
+                'food_expense': str(trip.food_expense),
+                'students': [s.name for s in students],
+            }
+
+            # Delete related inventory movements
+            InventoryMovement.objects.filter(related_trip=trip).delete()
+
+            # Delete related expenses (if any logged against this trip)
+            Expense.objects.filter(related_trip=trip).delete()
+
+            # Record audit log before deleting
+            AuditLog.objects.create(
+                user=user,
+                action='trip_delete',
+                entity_type='Trip',
+                entity_id=str(trip_id),
+                before_snapshot=before_snapshot,
+                reason=f"Permanently deleted Trip #{trip_id} to {trip.place.name if trip.place else 'Unknown'}",
+            )
+
+            # Delete the trip (cascades TripStudent)
+            trip.delete()
+
+            # If the trip was settled, recalculate commissions for participating students
+            if status_val == 'settled':
+                for student in students:
+                    FinancialService.recalculate_student_commission(campaign, student)
 
 
 class FinancialService:

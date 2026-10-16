@@ -323,12 +323,13 @@ class ExternalCollectionSerializer(serializers.ModelSerializer):
     created_by_name = serializers.CharField(source='created_by.display_name', read_only=True)
     updated_by_name = serializers.CharField(source='updated_by.display_name', read_only=True)
     campaign_year = serializers.IntegerField(source='campaign.year', read_only=True)
+    calendars_given = serializers.IntegerField(min_value=0, default=0)
 
     class Meta:
         model = ExternalCollection
         fields = [
             'id', 'campaign', 'campaign_year', 'received_from',
-            'amount', 'date_received', 'notes',
+            'amount', 'calendars_given', 'date_received', 'notes',
             'created_by', 'created_by_name',
             'updated_by', 'updated_by_name',
             'created_at', 'updated_at'
@@ -354,4 +355,14 @@ class ExternalCollectionSerializer(serializers.ModelSerializer):
         campaign = attrs.get('campaign') or (self.instance.campaign if self.instance else None)
         if campaign and campaign.status == 'closed':
             raise serializers.ValidationError("Cannot add or modify external collections in a closed campaign.")
+
+        calendars_given = attrs.get('calendars_given', self.instance.calendars_given if self.instance else 0)
+        if campaign and calendars_given > 0:
+            inv = InventoryService.get_campaign_inventory_summary(campaign)
+            current_allocated = self.instance.calendars_given if self.instance else 0
+            additional_needed = calendars_given - current_allocated
+            if additional_needed > inv['available_stock']:
+                raise serializers.ValidationError({
+                    'calendars_given': f"Insufficient stock: requested {calendars_given} calendars ({additional_needed} additional), but only {inv['available_stock']} calendars are available in this campaign."
+                })
         return attrs

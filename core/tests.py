@@ -1353,3 +1353,148 @@ class FinancialRulesAndOperationsTestCase(TestCase):
         expected_net_profit = Decimal('60000.00') - Decimal('600.00') - Decimal('400.00') - Decimal('900.00')
         self.assertEqual(summary_after['net_profit'], expected_net_profit)
 
+    def test_external_collection_calendars_given_and_inventory_deduction(self):
+        """Verify calendars given to external donor are subtracted from campaign available inventory."""
+        inv_before = InventoryService.get_campaign_inventory_summary(self.campaign)
+        initial_available = inv_before['available_stock']
+        self.assertEqual(inv_before['calendars_external'], 0)
+
+        client = APIClient()
+        client.force_authenticate(user=self.admin_user)
+        url = "/api/v1/external-collections/"
+
+        # 1. Create with 120 calendars given
+        res = client.post(url, {
+            'campaign': self.campaign.id,
+            'received_from': 'Patron With Calendars',
+            'amount': '15000.00',
+            'calendars_given': 120,
+            'date_received': '2026-10-16',
+            'notes': '120 calendars given directly to patron'
+        }, format='json')
+        self.assertEqual(res.status_code, 201)
+        self.assertEqual(res.data['calendars_given'], 120)
+
+        # 2. Check inventory summary
+        inv_after = InventoryService.get_campaign_inventory_summary(self.campaign)
+        self.assertEqual(inv_after['calendars_external'], 120)
+        self.assertEqual(inv_after['available_stock'], initial_available - 120)
+
+        # 3. Validation: Exceeding available stock
+        res_overflow = client.post(url, {
+            'campaign': self.campaign.id,
+            'received_from': 'Greedy Request',
+            'amount': '500000.00',
+            'calendars_given': inv_after['available_stock'] + 100,
+            'date_received': '2026-10-16'
+        }, format='json')
+        self.assertEqual(res_overflow.status_code, 400)
+        self.assertIn("Insufficient stock", str(res_overflow.data))
+
+    def test_trip_delete_in_progress_and_restore_stock(self):
+        """Verify deleting an in-progress trip restores available stock and records audit log."""
+        stock_before = InventoryService.get_campaign_inventory_summary(self.campaign)['available_stock']
+
+        trip = TripService.dispatch_trip(
+            campaign=self.campaign,
+            place=self.place1,
+            trip_date=timezone.now().date(),
+            departure_time='08:30:00',
+            student_ids=[self.student_a.id],
+            calendars_issued=60,
+            receipt_book=self.receipt_book,
+            receipt_starting_leaf=1,
+            bus_fare=Decimal('100.00'),
+            notes='Test dispatch for deletion',
+            user=self.superadmin
+        )
+        # In field stock is now 60, available stock is reduced by 60
+        stock_during = InventoryService.get_campaign_inventory_summary(self.campaign)['available_stock']
+        self.assertEqual(stock_during, stock_before - 60)
+
+        client = APIClient()
+        client.force_authenticate(user=self.admin_user)
+        res = client.delete(f"/api/v1/trips/{trip.id}/")
+        self.assertEqual(res.status_code, 204)
+
+        # Trip must be deleted
+        self.assertFalse(Trip.objects.filter(id=trip.id).exists())
+        # Inventory movements for this trip must be cleaned up
+        self.assertFalse(InventoryMovement.objects.filter(related_trip=trip).exists())
+        # Stock must be completely restored
+        stock_after = InventoryService.get_campaign_inventory_summary(self.campaign)['available_stock']
+        self.assertEqual(stock_after, stock_before)
+
+        # AuditLog recorded
+        log = AuditLog.objects.filter(action='trip_delete', entity_id=str(trip.id)).first()
+        self.assertIsNotNone(log)
+        self.assertEqual(log.user, self.admin_user)
+
+    def test_trip_delete_settled_and_recalculate_commission(self):
+        """Verify deleting a settled trip recalculates participating students' commissions."""
+        trip = TripService.dispatch_trip(
+            campaign=self.campaign,
+            place=self.place1,
+            trip_date=timezone.now().date(),
+            departure_time='09:00:00',
+            student_ids=[self.student_a.id],
+            calendars_issued=50,
+            receipt_book=self.receipt_book,
+            receipt_starting_leaf=1,
+            bus_fare=Decimal('200.00'),
+            notes='',
+            user=self.superadmin
+        )
+        TripService.settle_trip(
+            trip=trip,
+            return_time='16:00:00',
+            calendars_sold=50,
+            calendars_returned=0,
+            cash_collection=Decimal('5000.00'),
+            gpay_collection=Decimal('0.00'),
+            food_expense=Decimal('100.00'),
+            receipt_book=self.receipt_book,
+            receipt_starting_leaf=1,
+            receipt_ending_leaf=50,
+            voided_leaves='',
+            discrepancy_notes='',
+            user=self.superadmin
+        )
+
+        calc_before = FinancialService.recalculate_student_commission(self.campaign, self.student_a)
+        self.assertGreater(calc_before.calculated_commission, Decimal('0.00'))
+
+        client = APIClient()
+        client.force_authenticate(user=self.admin_user)
+        res = client.delete(f"/api/v1/trips/{trip.id}/")
+        self.assertEqual(res.status_code, 204)
+
+        # Commission should now be 0 as there are no settled trips
+        calc_after = FinancialService.recalculate_student_commission(self.campaign, self.student_a)
+        self.assertEqual(calc_after.calculated_commission, Decimal('0.00'))
+        self.assertEqual(calc_after.gross_collection, Decimal('0.00'))
+
+    def test_trip_delete_closed_campaign_forbidden(self):
+        """Verify trips belonging to closed campaigns cannot be deleted."""
+        trip = TripService.dispatch_trip(
+            campaign=self.campaign,
+            place=self.place1,
+            trip_date=timezone.now().date(),
+            departure_time='09:00:00',
+            student_ids=[self.student_a.id],
+            calendars_issued=20,
+            receipt_book=self.receipt_book,
+            receipt_starting_leaf=1,
+            bus_fare=Decimal('50.00'),
+            notes='',
+            user=self.superadmin
+        )
+        self.campaign.status = 'closed'
+        self.campaign.save()
+
+        client = APIClient()
+        client.force_authenticate(user=self.admin_user)
+        res = client.delete(f"/api/v1/trips/{trip.id}/")
+        self.assertEqual(res.status_code, 400)
+        self.assertIn("closed campaign", str(res.data))
+
