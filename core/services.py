@@ -447,15 +447,17 @@ class TripService:
             return trip
 
     @staticmethod
-    def delete_trip(trip: Trip, user: User | None) -> None:
+    def delete_trip(trip: Trip, user: User | None, reason: str = '') -> None:
         """
         Permanently delete a trip with full financial integrity:
+        - Prevents deletion if campaign is closed.
+        - Prevents deletion of settled trips if student commission has already been finalized.
+        - Prevents deletion of settled trips if disbursed payouts exceed revised commissions.
         - Reverses inventory deductions and restores available stock.
         - Removes trip participation shares.
         - Recalculates commissions for affected students if trip was settled.
         - Deletes associated expenses and inventory movements.
-        - Prevents deletion if campaign is closed.
-        - Records an immutable audit log snapshot.
+        - Records an immutable audit log snapshot with reason.
         """
         with transaction.atomic():
             trip = Trip.objects.select_for_update().get(id=trip.id)
@@ -467,9 +469,48 @@ class TripService:
             status_val = trip.status
             students = [ts.student for ts in trip.trip_students.select_related('student').all()]
 
+            if status_val == 'settled':
+                # Check 1: Finalized commissions
+                if CommissionCalculation.objects.filter(
+                    campaign=campaign, student__in=students, finalization_status='finalized'
+                ).exists():
+                    raise ValidationError(
+                        f"Cannot delete settled Trip #{trip_id}: Student commission has already been finalized for this campaign. Reopen or adjust commissions before deleting this trip."
+                    )
+
+                # Check 2: Outstanding payouts vs recalculated commission
+                for student in students:
+                    total_paid = CommissionPayout.objects.filter(
+                        campaign=campaign, student=student
+                    ).aggregate(t=Sum('amount'))['t'] or Decimal('0.00')
+
+                    if total_paid > Decimal('0.00'):
+                        # Calculate projected commission without this trip
+                        remaining_participations = TripStudent.objects.filter(
+                            trip__campaign=campaign,
+                            trip__status='settled',
+                            student=student
+                        ).exclude(trip=trip)
+
+                        rem_gross = remaining_participations.aggregate(t=Sum('gross_collection_share'))['t'] or Decimal('0.00')
+                        rem_fare = remaining_participations.aggregate(t=Sum('bus_fare_share'))['t'] or Decimal('0.00')
+                        rem_food = remaining_participations.aggregate(t=Sum('food_expense_share'))['t'] or Decimal('0.00')
+                        rem_net = rem_gross - rem_fare - rem_food
+
+                        if rem_net > Decimal('0.00'):
+                            projected_comm = ((rem_net * campaign.commission_percentage) / Decimal('100.00')).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+                        else:
+                            projected_comm = Decimal('0.00')
+
+                        if total_paid > projected_comm:
+                            raise ValidationError(
+                                f"Cannot delete settled Trip #{trip_id}: Student {student.name} has already received payout(s) totaling ₹{total_paid}, which would exceed their revised earned commission of ₹{projected_comm}. Delete or adjust the payout record first."
+                            )
+
             before_snapshot = {
                 'id': trip_id,
                 'campaign_id': campaign.id,
+                'campaign_year': campaign.year,
                 'place': trip.place.name if trip.place else None,
                 'status': status_val,
                 'trip_date': str(trip.trip_date),
@@ -480,7 +521,11 @@ class TripService:
                 'gpay_collection': str(trip.gpay_collection),
                 'bus_fare': str(trip.bus_fare),
                 'food_expense': str(trip.food_expense),
+                'receipt_book': trip.receipt_book.label if trip.receipt_book else None,
+                'receipt_starting_leaf': trip.receipt_starting_leaf,
+                'receipt_ending_leaf': trip.receipt_ending_leaf,
                 'students': [s.name for s in students],
+                'deletion_reason': reason.strip() if reason else None,
             }
 
             # Delete related inventory movements
@@ -490,13 +535,14 @@ class TripService:
             Expense.objects.filter(related_trip=trip).delete()
 
             # Record audit log before deleting
+            clean_reason = reason.strip() if reason else f"Permanently deleted Trip #{trip_id} to {trip.place.name if trip.place else 'Unknown'}"
             AuditLog.objects.create(
                 user=user,
                 action='trip_delete',
                 entity_type='Trip',
                 entity_id=str(trip_id),
                 before_snapshot=before_snapshot,
-                reason=f"Permanently deleted Trip #{trip_id} to {trip.place.name if trip.place else 'Unknown'}",
+                reason=clean_reason,
             )
 
             # Delete the trip (cascades TripStudent)

@@ -1414,8 +1414,8 @@ class FinancialRulesAndOperationsTestCase(TestCase):
 
         client = APIClient()
         client.force_authenticate(user=self.admin_user)
-        res = client.delete(f"/api/v1/trips/{trip.id}/")
-        self.assertEqual(res.status_code, 204)
+        res = client.delete(f"/api/v1/trips/{trip.id}/", {'reason': 'Cancelled dispatch due to rain'}, format='json')
+        self.assertIn(res.status_code, [200, 204])
 
         # Trip must be deleted
         self.assertFalse(Trip.objects.filter(id=trip.id).exists())
@@ -1425,10 +1425,11 @@ class FinancialRulesAndOperationsTestCase(TestCase):
         stock_after = InventoryService.get_campaign_inventory_summary(self.campaign)['available_stock']
         self.assertEqual(stock_after, stock_before)
 
-        # AuditLog recorded
+        # AuditLog recorded with reason
         log = AuditLog.objects.filter(action='trip_delete', entity_id=str(trip.id)).first()
         self.assertIsNotNone(log)
         self.assertEqual(log.user, self.admin_user)
+        self.assertEqual(log.reason, 'Cancelled dispatch due to rain')
 
     def test_trip_delete_settled_and_recalculate_commission(self):
         """Verify deleting a settled trip recalculates participating students' commissions."""
@@ -1467,7 +1468,7 @@ class FinancialRulesAndOperationsTestCase(TestCase):
         client = APIClient()
         client.force_authenticate(user=self.admin_user)
         res = client.delete(f"/api/v1/trips/{trip.id}/")
-        self.assertEqual(res.status_code, 204)
+        self.assertIn(res.status_code, [200, 204])
 
         # Commission should now be 0 as there are no settled trips
         calc_after = FinancialService.recalculate_student_commission(self.campaign, self.student_a)
@@ -1497,4 +1498,90 @@ class FinancialRulesAndOperationsTestCase(TestCase):
         res = client.delete(f"/api/v1/trips/{trip.id}/")
         self.assertEqual(res.status_code, 400)
         self.assertIn("closed campaign", str(res.data))
+
+    def test_trip_delete_finalized_commission_forbidden(self):
+        """Verify settled trips cannot be deleted if commissions have already been finalized."""
+        trip = TripService.dispatch_trip(
+            campaign=self.campaign,
+            place=self.place1,
+            trip_date=timezone.now().date(),
+            departure_time='09:00:00',
+            student_ids=[self.student_a.id],
+            calendars_issued=50,
+            receipt_book=self.receipt_book,
+            receipt_starting_leaf=1,
+            bus_fare=Decimal('100.00'),
+            notes='',
+            user=self.superadmin
+        )
+        TripService.settle_trip(
+            trip=trip,
+            return_time='16:00:00',
+            calendars_sold=50,
+            calendars_returned=0,
+            cash_collection=Decimal('5000.00'),
+            gpay_collection=Decimal('0.00'),
+            food_expense=Decimal('100.00'),
+            receipt_book=self.receipt_book,
+            receipt_starting_leaf=1,
+            receipt_ending_leaf=50,
+            voided_leaves='',
+            discrepancy_notes='',
+            user=self.superadmin
+        )
+        calc = FinancialService.recalculate_student_commission(self.campaign, self.student_a)
+        calc.finalization_status = 'finalized'
+        calc.save()
+
+        client = APIClient()
+        client.force_authenticate(user=self.admin_user)
+        res = client.delete(f"/api/v1/trips/{trip.id}/")
+        self.assertEqual(res.status_code, 400)
+        self.assertIn("already been finalized", str(res.data))
+
+    def test_trip_delete_disbursed_payout_exceeding_revised_forbidden(self):
+        """Verify settled trips cannot be deleted if payouts would exceed the revised earned commission."""
+        trip = TripService.dispatch_trip(
+            campaign=self.campaign,
+            place=self.place1,
+            trip_date=timezone.now().date(),
+            departure_time='09:00:00',
+            student_ids=[self.student_a.id],
+            calendars_issued=50,
+            receipt_book=self.receipt_book,
+            receipt_starting_leaf=1,
+            bus_fare=Decimal('100.00'),
+            notes='',
+            user=self.superadmin
+        )
+        TripService.settle_trip(
+            trip=trip,
+            return_time='16:00:00',
+            calendars_sold=50,
+            calendars_returned=0,
+            cash_collection=Decimal('5000.00'),
+            gpay_collection=Decimal('0.00'),
+            food_expense=Decimal('100.00'),
+            receipt_book=self.receipt_book,
+            receipt_starting_leaf=1,
+            receipt_ending_leaf=50,
+            voided_leaves='',
+            discrepancy_notes='',
+            user=self.superadmin
+        )
+        # Record payout for student_a
+        CommissionPayout.objects.create(
+            campaign=self.campaign,
+            student=self.student_a,
+            amount=Decimal('480.00'),
+            payment_date=timezone.now().date(),
+            payment_method='cash',
+            created_by=self.superadmin
+        )
+
+        client = APIClient()
+        client.force_authenticate(user=self.admin_user)
+        res = client.delete(f"/api/v1/trips/{trip.id}/")
+        self.assertEqual(res.status_code, 400)
+        self.assertIn("already received payout", str(res.data))
 

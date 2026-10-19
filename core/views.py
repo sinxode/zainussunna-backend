@@ -568,12 +568,27 @@ class TripViewSet(viewsets.ModelViewSet):
 
     def destroy(self, request, *args, **kwargs):
         """Permanently delete a trip with inventory and commission reconciliation."""
-        trip = self.get_object()
         try:
-            TripService.delete_trip(trip, request.user)
-            return Response(status=status.HTTP_204_NO_CONTENT)
+            trip = self.get_object()
+        except Exception:
+            return Response({'error': 'Trip not found or has already been deleted.'}, status=status.HTTP_404_NOT_FOUND)
+
+        reason = ''
+        if isinstance(request.data, dict):
+            reason = request.data.get('reason', '')
+        if not reason:
+            reason = request.query_params.get('reason', '')
+
+        try:
+            TripService.delete_trip(trip, request.user, reason=reason)
+            return Response({
+                'success': True,
+                'message': f"Trip #{trip.id} has been permanently deleted.",
+                'trip_id': trip.id,
+            }, status=status.HTTP_200_OK)
         except ValidationError as e:
-            return Response({'error': str(e.message if hasattr(e, 'message') else e)}, status=status.HTTP_400_BAD_REQUEST)
+            err_msg = e.message if hasattr(e, 'message') else str(e)
+            return Response({'error': err_msg}, status=status.HTTP_400_BAD_REQUEST)
         except Exception as e:
             return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
