@@ -1585,3 +1585,137 @@ class FinancialRulesAndOperationsTestCase(TestCase):
         self.assertEqual(res.status_code, 400)
         self.assertIn("already received payout", str(res.data))
 
+    def test_trip_edit_in_progress(self):
+        """Verify editing an in-progress trip updates fields, students, and inventory."""
+        trip = TripService.dispatch_trip(
+            campaign=self.campaign,
+            place=self.place1,
+            trip_date=timezone.now().date(),
+            departure_time='09:00:00',
+            student_ids=[self.student_a.id],
+            calendars_issued=50,
+            receipt_book=self.receipt_book,
+            receipt_starting_leaf=1,
+            bus_fare=Decimal('100.00'),
+            notes='Initial dispatch',
+            user=self.superadmin
+        )
+
+        client = APIClient()
+        client.force_authenticate(user=self.admin_user)
+        update_data = {
+            'place': self.place2.id,
+            'bus_fare': '150.00',
+            'calendars_issued': 65,
+            'student_ids': [self.student_b.id, self.student_c.id],
+            'notes': 'Updated place and students'
+        }
+        res = client.patch(f"/api/v1/trips/{trip.id}/", update_data, format='json')
+        self.assertEqual(res.status_code, 200)
+
+        trip.refresh_from_db()
+        self.assertEqual(trip.place, self.place2)
+        self.assertEqual(trip.bus_fare, Decimal('150.00'))
+        self.assertEqual(trip.calendars_issued, 65)
+        self.assertEqual(trip.discrepancy_notes, 'Updated place and students')
+
+        # Check students updated
+        assigned_students = list(trip.trip_students.values_list('student_id', flat=True))
+        self.assertIn(self.student_b.id, assigned_students)
+        self.assertIn(self.student_c.id, assigned_students)
+        self.assertNotIn(self.student_a.id, assigned_students)
+
+        # Check inventory movement updated
+        mov = InventoryMovement.objects.get(related_trip=trip, movement_type='trip_issue')
+        self.assertEqual(mov.quantity, -65)
+
+    def test_trip_edit_settled(self):
+        """Verify editing a settled trip updates sales, inventory, and student commissions."""
+        trip = TripService.dispatch_trip(
+            campaign=self.campaign,
+            place=self.place1,
+            trip_date=timezone.now().date(),
+            departure_time='09:00:00',
+            student_ids=[self.student_a.id],
+            calendars_issued=50,
+            receipt_book=self.receipt_book,
+            receipt_starting_leaf=1,
+            bus_fare=Decimal('100.00'),
+            notes='',
+            user=self.superadmin
+        )
+        TripService.settle_trip(
+            trip=trip,
+            return_time='16:00:00',
+            calendars_sold=40,
+            calendars_returned=10,
+            cash_collection=Decimal('4000.00'),
+            gpay_collection=Decimal('0.00'),
+            food_expense=Decimal('200.00'),
+            receipt_book=self.receipt_book,
+            receipt_starting_leaf=1,
+            receipt_ending_leaf=40,
+            voided_leaves='',
+            discrepancy_notes='',
+            user=self.superadmin
+        )
+
+        calc = CommissionCalculation.objects.get(campaign=self.campaign, student=self.student_a)
+        # Net: 4000 - 100 - 200 = 3700. 10% commission = 370.00
+        self.assertEqual(calc.calculated_commission, Decimal('370.00'))
+
+        client = APIClient()
+        client.force_authenticate(user=self.admin_user)
+        # Edit settlement: sold 45, returned 5, cash 4500, food 100
+        update_data = {
+            'calendars_sold': 45,
+            'calendars_returned': 5,
+            'cash_collection': '4500.00',
+            'food_expense': '100.00',
+            'receipt_ending_leaf': 45,
+            'discrepancy_notes': 'Corrected leaf count and collection'
+        }
+        res = client.patch(f"/api/v1/trips/{trip.id}/", update_data, format='json')
+        self.assertEqual(res.status_code, 200)
+
+        trip.refresh_from_db()
+        self.assertEqual(trip.calendars_sold, 45)
+        self.assertEqual(trip.calendars_returned, 5)
+        self.assertEqual(trip.cash_collection, Decimal('4500.00'))
+        self.assertEqual(trip.food_expense, Decimal('100.00'))
+
+        # Check commission recalculated: net = 4500 - 100 - 100 = 4300. 10% = 430.00
+        calc.refresh_from_db()
+        self.assertEqual(calc.calculated_commission, Decimal('430.00'))
+
+        # Check inventory movements
+        sold_mov = InventoryMovement.objects.get(related_trip=trip, movement_type='trip_sold')
+        self.assertEqual(sold_mov.quantity, -45)
+        ret_mov = InventoryMovement.objects.get(related_trip=trip, movement_type='trip_return_unsold')
+        self.assertEqual(ret_mov.quantity, 5)
+
+    def test_trip_edit_closed_campaign_forbidden(self):
+        """Verify editing trips belonging to a closed campaign is rejected."""
+        trip = TripService.dispatch_trip(
+            campaign=self.campaign,
+            place=self.place1,
+            trip_date=timezone.now().date(),
+            departure_time='09:00:00',
+            student_ids=[self.student_a.id],
+            calendars_issued=20,
+            receipt_book=self.receipt_book,
+            receipt_starting_leaf=1,
+            bus_fare=Decimal('0.00'),
+            notes='',
+            user=self.superadmin
+        )
+        self.campaign.status = 'closed'
+        self.campaign.save()
+
+        client = APIClient()
+        client.force_authenticate(user=self.admin_user)
+        res = client.patch(f"/api/v1/trips/{trip.id}/", {'notes': 'Should fail'}, format='json')
+        self.assertEqual(res.status_code, 400)
+        self.assertIn("closed campaign", str(res.data))
+
+

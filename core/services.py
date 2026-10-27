@@ -553,6 +553,305 @@ class TripService:
                 for student in students:
                     FinancialService.recalculate_student_commission(campaign, student)
 
+    @staticmethod
+    def update_trip(trip: Trip, data: dict, user: User | None) -> Trip:
+        """
+        Atomically update an in-progress or settled trip with complete financial,
+        inventory, and commission recalculations.
+        """
+        with transaction.atomic():
+            trip = Trip.objects.select_for_update().get(id=trip.id)
+            campaign = trip.campaign
+
+            if campaign.status == 'closed':
+                raise ValidationError("Cannot edit trips belonging to a closed campaign.")
+
+            if trip.status == 'voided':
+                raise ValidationError("Cannot edit a voided trip.")
+
+            before_snapshot = {
+                'id': trip.id,
+                'status': trip.status,
+                'place': trip.place.name if trip.place else None,
+                'trip_date': str(trip.trip_date),
+                'calendars_issued': trip.calendars_issued,
+                'calendars_sold': trip.calendars_sold,
+                'calendars_returned': trip.calendars_returned,
+                'bus_fare': str(trip.bus_fare),
+                'food_expense': str(trip.food_expense),
+                'cash_collection': str(trip.cash_collection),
+                'gpay_collection': str(trip.gpay_collection),
+                'students': [s.name for s in Student.objects.filter(trip_participations__trip=trip)],
+            }
+
+            # Common Dispatch Fields
+            if 'place' in data and data['place']:
+                trip.place = data['place']
+            if 'trip_date' in data and data['trip_date']:
+                trip.trip_date = data['trip_date']
+            if 'departure_time' in data:
+                trip.departure_time = data['departure_time']
+            if 'bus_fare' in data and data['bus_fare'] is not None:
+                if data['bus_fare'] < Decimal('0.00'):
+                    raise ValidationError("Bus fare cannot be negative.")
+                trip.bus_fare = data['bus_fare']
+            if 'notes' in data and data['notes'] is not None:
+                trip.discrepancy_notes = data['notes']
+
+            # Receipt Book & Starting Leaf
+            if 'receipt_book' in data:
+                trip.receipt_book = data['receipt_book']
+            if 'receipt_starting_leaf' in data:
+                trip.receipt_starting_leaf = data['receipt_starting_leaf']
+
+            if trip.receipt_book and trip.receipt_starting_leaf:
+                if (trip.receipt_starting_leaf < trip.receipt_book.first_leaf or
+                    trip.receipt_starting_leaf > trip.receipt_book.last_leaf):
+                    raise ValidationError(
+                        f"Receipt starting leaf {trip.receipt_starting_leaf} is outside book range {trip.receipt_book.first_leaf}-{trip.receipt_book.last_leaf}."
+                    )
+
+            # Calendars Issued
+            if 'calendars_issued' in data and data['calendars_issued'] is not None:
+                new_issued = data['calendars_issued']
+                if new_issued <= 0:
+                    raise ValidationError("Issued calendar quantity must be greater than zero.")
+                if new_issued != trip.calendars_issued:
+                    diff_issued = new_issued - trip.calendars_issued
+                    # Check stock if increasing issued calendars
+                    if diff_issued > 0:
+                        summary = InventoryService.get_campaign_inventory_summary(campaign)
+                        if diff_issued > summary['available_stock']:
+                            raise ValidationError(
+                                f"Insufficient stock: requesting {diff_issued} additional calendars, but only {summary['available_stock']} are available."
+                            )
+                    trip.calendars_issued = new_issued
+
+                    # Update or create the trip_issue movement
+                    issue_mov = InventoryMovement.objects.filter(related_trip=trip, movement_type='trip_issue').first()
+                    if issue_mov:
+                        issue_mov.quantity = -new_issued
+                        issue_mov.reason = f"Issued for Trip #{trip.id} to {trip.place.name if trip.place else 'destination'} (Updated)"
+                        issue_mov.save()
+                    else:
+                        InventoryMovement.objects.create(
+                            campaign=campaign,
+                            movement_type='trip_issue',
+                            quantity=-new_issued,
+                            related_trip=trip,
+                            reason=f"Issued for Trip #{trip.id} to {trip.place.name if trip.place else 'destination'}",
+                            created_by=user,
+                        )
+
+            # Student Assignment Handling
+            current_students = list(Student.objects.filter(trip_participations__trip=trip))
+            all_affected_students = set(current_students)
+
+            if 'student_ids' in data and data['student_ids'] is not None:
+                student_ids = data['student_ids']
+                if not (1 <= len(student_ids) <= 3):
+                    raise ValidationError("A trip must have between 1 and 3 students.")
+                if len(set(student_ids)) != len(student_ids):
+                    raise ValidationError("Duplicate students cannot be assigned to the same trip.")
+                new_students = list(Student.objects.filter(id__in=student_ids, is_active=True))
+                if len(new_students) != len(student_ids):
+                    raise ValidationError("One or more selected students are invalid or inactive.")
+
+                # If in_progress, ensure no student is already on another active trip
+                if trip.status == 'in_progress':
+                    open_conflicts = Trip.objects.filter(
+                        campaign=campaign,
+                        status='in_progress',
+                        trip_students__student__in=new_students
+                    ).exclude(id=trip.id).distinct()
+                    if open_conflicts.exists():
+                        conflict_trip = open_conflicts.first()
+                        conflicting = Student.objects.filter(
+                            trip_participations__trip=conflict_trip,
+                            id__in=student_ids
+                        ).values_list('name', flat=True)
+                        raise ValidationError(
+                            f"Student(s) {', '.join(conflicting)} already assigned to active Trip #{conflict_trip.id}."
+                        )
+
+                # Recreate student assignments
+                all_affected_students.update(new_students)
+                TripStudent.objects.filter(trip=trip).delete()
+                for st in new_students:
+                    TripStudent.objects.create(trip=trip, student=st)
+                current_students = new_students
+
+            # -------------------------------------------------------------
+            # Status Specific Logic: IN_PROGRESS
+            # -------------------------------------------------------------
+            if trip.status == 'in_progress':
+                trip.save()
+
+            # -------------------------------------------------------------
+            # Status Specific Logic: SETTLED
+            # -------------------------------------------------------------
+            elif trip.status == 'settled':
+                # Finalized commission check
+                if CommissionCalculation.objects.filter(
+                    campaign=campaign, student__in=all_affected_students, finalization_status='finalized'
+                ).exists():
+                    raise ValidationError(
+                        "Cannot edit settled trip: Student commission has already been finalized for this campaign."
+                    )
+
+                # Update settlement fields if passed
+                if 'return_time' in data:
+                    trip.return_time = data['return_time']
+                if 'calendars_sold' in data and data['calendars_sold'] is not None:
+                    if data['calendars_sold'] < 0:
+                        raise ValidationError("Sold quantity cannot be negative.")
+                    trip.calendars_sold = data['calendars_sold']
+                if 'calendars_returned' in data and data['calendars_returned'] is not None:
+                    if data['calendars_returned'] < 0:
+                        raise ValidationError("Returned quantity cannot be negative.")
+                    trip.calendars_returned = data['calendars_returned']
+                if 'cash_collection' in data and data['cash_collection'] is not None:
+                    if data['cash_collection'] < Decimal('0.00'):
+                        raise ValidationError("Cash collection cannot be negative.")
+                    trip.cash_collection = data['cash_collection']
+                if 'gpay_collection' in data and data['gpay_collection'] is not None:
+                    if data['gpay_collection'] < Decimal('0.00'):
+                        raise ValidationError("GPay collection cannot be negative.")
+                    trip.gpay_collection = data['gpay_collection']
+                if 'food_expense' in data and data['food_expense'] is not None:
+                    if data['food_expense'] < Decimal('0.00'):
+                        raise ValidationError("Food expense cannot be negative.")
+                    trip.food_expense = data['food_expense']
+                if 'receipt_ending_leaf' in data:
+                    trip.receipt_ending_leaf = data['receipt_ending_leaf']
+                if 'voided_leaves' in data and data['voided_leaves'] is not None:
+                    trip.voided_leaves = data['voided_leaves']
+                if 'discrepancy_notes' in data and data['discrepancy_notes'] is not None:
+                    trip.discrepancy_notes = data['discrepancy_notes']
+
+                # Validate receipt range if ending leaf provided
+                if trip.receipt_book and trip.receipt_starting_leaf and trip.receipt_ending_leaf:
+                    ReceiptBookService.validate_leaf_range(
+                        trip.receipt_book, trip.receipt_starting_leaf, trip.receipt_ending_leaf, exclude_trip_id=trip.id
+                    )
+
+                # Discrepancy checks & review status
+                total_col = trip.cash_collection + trip.gpay_collection
+                expected_min = Decimal(trip.calendars_sold) * campaign.min_expected_collection_per_calendar
+                shortfall = expected_min - total_col
+                stock_disc = trip.calendars_issued - (trip.calendars_sold + trip.calendars_returned)
+
+                needs_rev = False
+                reasons = []
+                if shortfall > 0:
+                    needs_rev = True
+                    reasons.append(f"Collection shortfall of ₹{shortfall:.2f} below expected ₹{expected_min:.2f}")
+                if stock_disc != 0:
+                    needs_rev = True
+                    reasons.append(f"Stock discrepancy: issued {trip.calendars_issued}, but sold ({trip.calendars_sold}) + returned ({trip.calendars_returned}) = {trip.calendars_sold + trip.calendars_returned}")
+                if total_col < (trip.bus_fare + trip.food_expense):
+                    needs_rev = True
+                    reasons.append(f"Negative trip net: collection ₹{total_col:.2f} is less than expenses ₹{(trip.bus_fare + trip.food_expense):.2f}")
+
+                if needs_rev and not trip.discrepancy_notes.strip():
+                    raise ValidationError(f"Warning: {'; '.join(reasons)}. An explanatory note is required to save these changes.")
+
+                trip.review_status = 'needs_review' if needs_rev else 'no_review_needed'
+                trip.save()
+
+                # Update Inventory Movements for sold and returned
+                sold_mov = InventoryMovement.objects.filter(related_trip=trip, movement_type='trip_sold').first()
+                if trip.calendars_sold > 0:
+                    if sold_mov:
+                        sold_mov.quantity = -trip.calendars_sold
+                        sold_mov.save()
+                    else:
+                        InventoryMovement.objects.create(
+                            campaign=campaign,
+                            movement_type='trip_sold',
+                            quantity=-trip.calendars_sold,
+                            related_trip=trip,
+                            reason=f"Settled sales from Trip #{trip.id}",
+                            created_by=user,
+                        )
+                elif sold_mov:
+                    sold_mov.delete()
+
+                ret_mov = InventoryMovement.objects.filter(related_trip=trip, movement_type='trip_return_unsold').first()
+                if trip.calendars_returned > 0:
+                    if ret_mov:
+                        ret_mov.quantity = trip.calendars_returned
+                        ret_mov.save()
+                    else:
+                        InventoryMovement.objects.create(
+                            campaign=campaign,
+                            movement_type='trip_return_unsold',
+                            quantity=trip.calendars_returned,
+                            related_trip=trip,
+                            reason=f"Returned unsold from Trip #{trip.id}",
+                            created_by=user,
+                        )
+                elif ret_mov:
+                    ret_mov.delete()
+
+                # Re-allocate trip shares among current students
+                participations = list(trip.trip_students.select_related('student').order_by('id'))
+                count = len(participations)
+                if count > 0:
+                    col_shares = split_amount_in_paise(total_col, count)
+                    fare_shares = split_amount_in_paise(trip.bus_fare, count)
+                    food_shares = split_amount_in_paise(trip.food_expense, count)
+
+                    for idx, part in enumerate(participations):
+                        part.gross_collection_share = col_shares[idx]
+                        part.bus_fare_share = fare_shares[idx]
+                        part.food_expense_share = food_shares[idx]
+                        part.net_collection_share = col_shares[idx] - fare_shares[idx] - food_shares[idx]
+                        part.save()
+
+                # Recalculate commissions for all affected students
+                for st in all_affected_students:
+                    FinancialService.recalculate_student_commission(campaign, st)
+
+                # Verify payout boundaries
+                for st in all_affected_students:
+                    total_paid = CommissionPayout.objects.filter(
+                        campaign=campaign, student=st
+                    ).aggregate(t=Sum('amount'))['t'] or Decimal('0.00')
+                    calc = CommissionCalculation.objects.filter(campaign=campaign, student=st).first()
+                    if calc and calc.calculated_commission < total_paid:
+                        raise ValidationError(
+                            f"Cannot save changes: Student {st.name} was already paid ₹{total_paid}, but revised commission would be ₹{calc.calculated_commission}."
+                        )
+
+            # Audit log
+            after_snapshot = {
+                'id': trip.id,
+                'status': trip.status,
+                'place': trip.place.name if trip.place else None,
+                'trip_date': str(trip.trip_date),
+                'calendars_issued': trip.calendars_issued,
+                'calendars_sold': trip.calendars_sold,
+                'calendars_returned': trip.calendars_returned,
+                'bus_fare': str(trip.bus_fare),
+                'food_expense': str(trip.food_expense),
+                'cash_collection': str(trip.cash_collection),
+                'gpay_collection': str(trip.gpay_collection),
+                'students': [s.name for s in Student.objects.filter(trip_participations__trip=trip)],
+            }
+
+            AuditLog.objects.create(
+                user=user,
+                action='trip_edit',
+                entity_type='Trip',
+                entity_id=str(trip.id),
+                before_snapshot=before_snapshot,
+                after_snapshot=after_snapshot,
+                reason=f"Trip #{trip.id} ({trip.status}) updated by {user.display_name if user else 'Admin'}",
+            )
+
+            return trip
+
 
 class FinancialService:
     @staticmethod

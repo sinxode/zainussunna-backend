@@ -227,6 +227,30 @@ class TripVoidSerializer(serializers.Serializer):
     reason = serializers.CharField(required=True, min_length=3)
 
 
+class TripUpdateSerializer(serializers.Serializer):
+    # Common / Dispatch fields
+    place = serializers.PrimaryKeyRelatedField(queryset=Place.objects.all(), required=False)
+    trip_date = serializers.DateField(required=False)
+    departure_time = serializers.TimeField(required=False, allow_null=True)
+    student_ids = serializers.ListField(child=serializers.IntegerField(), min_length=1, max_length=3, required=False)
+    calendars_issued = serializers.IntegerField(min_value=1, required=False)
+    bus_fare = serializers.DecimalField(max_digits=10, decimal_places=2, min_value=Decimal('0.00'), required=False)
+    receipt_book = serializers.PrimaryKeyRelatedField(queryset=ReceiptBook.objects.all(), required=False, allow_null=True)
+    receipt_starting_leaf = serializers.IntegerField(required=False, allow_null=True)
+    notes = serializers.CharField(required=False, allow_blank=True)
+
+    # Settled-specific fields
+    return_time = serializers.TimeField(required=False, allow_null=True)
+    calendars_sold = serializers.IntegerField(min_value=0, required=False)
+    calendars_returned = serializers.IntegerField(min_value=0, required=False)
+    cash_collection = serializers.DecimalField(max_digits=10, decimal_places=2, min_value=Decimal('0.00'), required=False)
+    gpay_collection = serializers.DecimalField(max_digits=10, decimal_places=2, min_value=Decimal('0.00'), required=False)
+    food_expense = serializers.DecimalField(max_digits=10, decimal_places=2, min_value=Decimal('0.00'), required=False)
+    receipt_ending_leaf = serializers.IntegerField(required=False, allow_null=True)
+    voided_leaves = serializers.CharField(required=False, allow_blank=True)
+    discrepancy_notes = serializers.CharField(required=False, allow_blank=True)
+
+
 class InventoryMovementSerializer(serializers.ModelSerializer):
     created_by_name = serializers.CharField(source='created_by.display_name', read_only=True)
     place_name = serializers.CharField(source='related_trip.place.name', read_only=True)

@@ -22,7 +22,7 @@ from .serializers import (
     UserSerializer, UserCreateSerializer, ChangePasswordSerializer,
     CampaignSerializer, StudentSerializer, PlaceSerializer,
     ReceiptBookSerializer, TripSerializer, TripDispatchSerializer,
-    TripSettleSerializer, TripVoidSerializer, TripReviewSerializer,
+    TripSettleSerializer, TripVoidSerializer, TripReviewSerializer, TripUpdateSerializer,
     InventoryMovementSerializer, InventoryAdjustmentSerializer,
     ExpenseSerializer, ExpenseVoidSerializer,
     CommissionCalculationSerializer, CommissionPayoutSerializer,
@@ -500,6 +500,24 @@ class TripViewSet(viewsets.ModelViewSet):
             return Response(TripSerializer(trip).data, status=status.HTTP_201_CREATED)
         except Exception as e:
             return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    def update(self, request, *args, **kwargs):
+        """Update an in-progress or settled trip with integrity checks."""
+        trip = self.get_object()
+        serializer = TripUpdateSerializer(data=request.data, partial=kwargs.get('partial', False))
+        serializer.is_valid(raise_exception=True)
+        try:
+            updated_trip = TripService.update_trip(trip, serializer.validated_data, request.user)
+            return Response(TripSerializer(updated_trip).data)
+        except ValidationError as e:
+            err_msg = e.message if hasattr(e, 'message') else str(e)
+            return Response({'error': err_msg}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    def partial_update(self, request, *args, **kwargs):
+        kwargs['partial'] = True
+        return self.update(request, *args, **kwargs)
 
     @action(detail=True, methods=['post'], url_path='settle')
     def settle(self, request, pk=None):
