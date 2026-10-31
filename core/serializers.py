@@ -4,7 +4,7 @@ from django.db.models import Sum
 from rest_framework import serializers
 from .models import (
     User, Campaign, Student, Place, ReceiptBook,
-    Trip, TripStudent, InventoryMovement, Expense,
+    Trip, TripStudent, TripReceiptBook, InventoryMovement, Expense,
     CommissionCalculation, CommissionPayout, AuditLog,
     ExternalCollection, normalize_phone_number
 )
@@ -160,10 +160,32 @@ class TripStudentSerializer(serializers.ModelSerializer):
         ]
 
 
+class TripReceiptBookSerializer(serializers.ModelSerializer):
+    receipt_book_label = serializers.CharField(source='receipt_book.label', read_only=True)
+    first_leaf = serializers.IntegerField(source='receipt_book.first_leaf', read_only=True)
+    last_leaf = serializers.IntegerField(source='receipt_book.last_leaf', read_only=True)
+
+    class Meta:
+        model = TripReceiptBook
+        fields = [
+            'id', 'receipt_book', 'receipt_book_label',
+            'starting_leaf', 'ending_leaf', 'voided_leaves',
+            'first_leaf', 'last_leaf'
+        ]
+
+
+class TripReceiptBookInputSerializer(serializers.Serializer):
+    receipt_book = serializers.PrimaryKeyRelatedField(queryset=ReceiptBook.objects.all())
+    starting_leaf = serializers.IntegerField(required=False, allow_null=True)
+    ending_leaf = serializers.IntegerField(required=False, allow_null=True)
+    voided_leaves = serializers.CharField(required=False, allow_blank=True, default='')
+
+
 class TripSerializer(serializers.ModelSerializer):
     place_name = serializers.CharField(source='place.name', read_only=True)
     receipt_book_label = serializers.CharField(source='receipt_book.label', read_only=True)
     trip_students = TripStudentSerializer(many=True, read_only=True)
+    trip_receipt_books = TripReceiptBookSerializer(many=True, read_only=True)
     total_collection = serializers.DecimalField(max_digits=10, decimal_places=2, read_only=True)
     expected_minimum_collection = serializers.DecimalField(max_digits=10, decimal_places=2, read_only=True)
     stock_discrepancy = serializers.IntegerField(read_only=True)
@@ -182,7 +204,8 @@ class TripSerializer(serializers.ModelSerializer):
             'collection_shortfall', 'receipt_book', 'receipt_book_label',
             'receipt_starting_leaf', 'receipt_ending_leaf', 'voided_leaves',
             'discrepancy_notes', 'created_by', 'created_by_name',
-            'settled_by', 'settled_by_name', 'created_at', 'settled_at', 'trip_students'
+            'settled_by', 'settled_by_name', 'created_at', 'settled_at',
+            'trip_students', 'trip_receipt_books'
         ]
         read_only_fields = [
             'id', 'created_by', 'settled_by', 'created_at',
@@ -200,6 +223,7 @@ class TripDispatchSerializer(serializers.Serializer):
     calendars_issued = serializers.IntegerField(min_value=1)
     receipt_book = serializers.PrimaryKeyRelatedField(queryset=ReceiptBook.objects.all(), required=False, allow_null=True)
     receipt_starting_leaf = serializers.IntegerField(required=False, allow_null=True)
+    receipt_books = TripReceiptBookInputSerializer(many=True, required=False)
     bus_fare = serializers.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00'))
     notes = serializers.CharField(required=False, allow_blank=True, default='')
 
@@ -214,6 +238,7 @@ class TripSettleSerializer(serializers.Serializer):
     receipt_book = serializers.PrimaryKeyRelatedField(queryset=ReceiptBook.objects.all(), required=False, allow_null=True)
     receipt_starting_leaf = serializers.IntegerField(required=False, allow_null=True)
     receipt_ending_leaf = serializers.IntegerField(required=False, allow_null=True)
+    receipt_books = TripReceiptBookInputSerializer(many=True, required=False)
     voided_leaves = serializers.CharField(required=False, allow_blank=True, default='')
     discrepancy_notes = serializers.CharField(required=False, allow_blank=True, default='')
 
@@ -237,6 +262,7 @@ class TripUpdateSerializer(serializers.Serializer):
     bus_fare = serializers.DecimalField(max_digits=10, decimal_places=2, min_value=Decimal('0.00'), required=False)
     receipt_book = serializers.PrimaryKeyRelatedField(queryset=ReceiptBook.objects.all(), required=False, allow_null=True)
     receipt_starting_leaf = serializers.IntegerField(required=False, allow_null=True)
+    receipt_books = TripReceiptBookInputSerializer(many=True, required=False)
     notes = serializers.CharField(required=False, allow_blank=True)
 
     # Settled-specific fields

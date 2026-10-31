@@ -1718,4 +1718,88 @@ class FinancialRulesAndOperationsTestCase(TestCase):
         self.assertEqual(res.status_code, 400)
         self.assertIn("closed campaign", str(res.data))
 
+    def test_place_creation_idempotent(self):
+        """Verify adding a place with existing name (case-insensitive) succeeds with 200."""
+        client = APIClient()
+        client.force_authenticate(user=self.admin_user)
+
+        # self.place1 is 'Calicut Beach'
+        res = client.post('/api/v1/places/', {'name': '  calicut beach  '}, format='json')
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.data['id'], self.place1.id)
+        self.assertEqual(res.data['name'], 'Calicut Beach')
+
+        # New place creates normally
+        res_new = client.post('/api/v1/places/', {'name': 'Feroke Bridge'}, format='json')
+        self.assertEqual(res_new.status_code, 201)
+        self.assertEqual(res_new.data['name'], 'Feroke Bridge')
+
+    def test_trip_multiple_receipt_books(self):
+        """Verify assigning, dispatching, and settling multiple receipt books for a trip."""
+        book2 = ReceiptBook.objects.create(
+            campaign=self.campaign,
+            label='Book-02',
+            first_leaf=101,
+            last_leaf=200,
+        )
+
+        client = APIClient()
+        client.force_authenticate(user=self.admin_user)
+
+        # Dispatch with 2 receipt books
+        payload = {
+            'campaign': self.campaign.id,
+            'place': self.place1.id,
+            'trip_date': str(timezone.now().date()),
+            'departure_time': '08:30:00',
+            'student_ids': [self.student_a.id, self.student_b.id],
+            'calendars_issued': 50,
+            'bus_fare': '50.00',
+            'notes': 'Multi-book test',
+            'receipt_books': [
+                {'receipt_book': self.receipt_book.id, 'starting_leaf': 1},
+                {'receipt_book': book2.id, 'starting_leaf': 101},
+            ]
+        }
+        res = client.post('/api/v1/trips/', payload, format='json')
+        self.assertEqual(res.status_code, 201)
+        trip_id = res.data['id']
+        self.assertEqual(len(res.data['trip_receipt_books']), 2)
+
+        # Settle trip with ending leaves for both books
+        settle_payload = {
+            'return_time': '17:00:00',
+            'calendars_sold': 45,
+            'calendars_returned': 5,
+            'cash_collection': '4500.00',
+            'gpay_collection': '0.00',
+            'food_expense': '100.00',
+            'receipt_books': [
+                {'receipt_book': self.receipt_book.id, 'starting_leaf': 1, 'ending_leaf': 25, 'voided_leaves': '13'},
+                {'receipt_book': book2.id, 'starting_leaf': 101, 'ending_leaf': 120, 'voided_leaves': ''},
+            ],
+            'discrepancy_notes': ''
+        }
+        res_settle = client.post(f'/api/v1/trips/{trip_id}/settle/', settle_payload, format='json')
+        self.assertEqual(res_settle.status_code, 200)
+        self.assertEqual(res_settle.data['status'], 'settled')
+        self.assertEqual(len(res_settle.data['trip_receipt_books']), 2)
+
+        trb1 = res_settle.data['trip_receipt_books'][0]
+        self.assertEqual(trb1['starting_leaf'], 1)
+        self.assertEqual(trb1['ending_leaf'], 25)
+        self.assertEqual(trb1['voided_leaves'], '13')
+
+        trb2 = res_settle.data['trip_receipt_books'][1]
+        self.assertEqual(trb2['starting_leaf'], 101)
+        self.assertEqual(trb2['ending_leaf'], 120)
+
+        # Verify next suggested leaves for both books
+        res_usage1 = client.get(f'/api/v1/receipt-books/{self.receipt_book.id}/usage/')
+        self.assertEqual(res_usage1.data['next_suggested_leaf'], 26)
+
+        res_usage2 = client.get(f'/api/v1/receipt-books/{book2.id}/usage/')
+        self.assertEqual(res_usage2.data['next_suggested_leaf'], 121)
+
+
 

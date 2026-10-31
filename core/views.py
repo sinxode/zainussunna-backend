@@ -14,7 +14,7 @@ from rest_framework_simplejwt.tokens import RefreshToken
 
 from .models import (
     User, Campaign, Student, Place, ReceiptBook,
-    Trip, TripStudent, InventoryMovement, Expense,
+    Trip, TripStudent, TripReceiptBook, InventoryMovement, Expense,
     CommissionCalculation, CommissionPayout, AuditLog,
     ExternalCollection, normalize_phone_number
 )
@@ -402,6 +402,19 @@ class PlaceViewSet(viewsets.ModelViewSet):
             qs = qs.filter(name__icontains=search)
         return qs
 
+    def create(self, request, *args, **kwargs):
+        name = request.data.get('name', '')
+        if isinstance(name, str):
+            clean_name = name.strip()
+            if not clean_name:
+                return Response({'name': ['Place name cannot be blank.']}, status=status.HTTP_400_BAD_REQUEST)
+            # Find existing place case-insensitively or exact match
+            existing = Place.objects.filter(name__iexact=clean_name).first()
+            if existing:
+                return Response(PlaceSerializer(existing).data, status=status.HTTP_200_OK)
+            request.data['name'] = clean_name
+        return super().create(request, *args, **kwargs)
+
 
 # --- Receipt Books ViewSet ---
 
@@ -420,14 +433,36 @@ class ReceiptBookViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['get'], url_path='usage')
     def usage(self, request, pk=None):
         book = self.get_object()
-        trips = Trip.objects.filter(receipt_book=book).exclude(status='voided').order_by('receipt_starting_leaf')
+        trbs = TripReceiptBook.objects.filter(
+            receipt_book=book
+        ).exclude(trip__status='voided').select_related('trip', 'trip__place').order_by('starting_leaf')
+
         ranges = []
-        for t in trips:
+        seen_trip_ids = set()
+        for trb in trbs:
+            if trb.starting_leaf and trb.ending_leaf:
+                seen_trip_ids.add(trb.trip_id)
+                ranges.append({
+                    'trip_id': trb.trip.id,
+                    'trip_date': trb.trip.trip_date,
+                    'place': trb.trip.place.name if trb.trip.place else 'Unknown',
+                    'starting_leaf': trb.starting_leaf,
+                    'ending_leaf': trb.ending_leaf,
+                    'count': trb.ending_leaf - trb.starting_leaf + 1,
+                    'voided_leaves': trb.voided_leaves,
+                    'status': trb.trip.status,
+                })
+
+        # Also include legacy direct trips if not already captured
+        legacy_trips = Trip.objects.filter(
+            receipt_book=book
+        ).exclude(status='voided').exclude(id__in=seen_trip_ids).order_by('receipt_starting_leaf')
+        for t in legacy_trips:
             if t.receipt_starting_leaf and t.receipt_ending_leaf:
                 ranges.append({
                     'trip_id': t.id,
                     'trip_date': t.trip_date,
-                    'place': t.place.name,
+                    'place': t.place.name if t.place else 'Unknown',
                     'starting_leaf': t.receipt_starting_leaf,
                     'ending_leaf': t.receipt_ending_leaf,
                     'count': t.receipt_ending_leaf - t.receipt_starting_leaf + 1,
@@ -495,7 +530,8 @@ class TripViewSet(viewsets.ModelViewSet):
                 receipt_starting_leaf=data.get('receipt_starting_leaf'),
                 bus_fare=data.get('bus_fare', Decimal('0.00')),
                 notes=data.get('notes', ''),
-                user=request.user
+                user=request.user,
+                receipt_books=data.get('receipt_books'),
             )
             return Response(TripSerializer(trip).data, status=status.HTTP_201_CREATED)
         except Exception as e:
@@ -541,7 +577,8 @@ class TripViewSet(viewsets.ModelViewSet):
                 receipt_ending_leaf=data.get('receipt_ending_leaf'),
                 voided_leaves=data.get('voided_leaves', ''),
                 discrepancy_notes=data.get('discrepancy_notes', ''),
-                user=request.user
+                user=request.user,
+                receipt_books=data.get('receipt_books'),
             )
             return Response(TripSerializer(settled_trip).data)
         except Exception as e:

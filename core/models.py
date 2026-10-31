@@ -253,6 +253,20 @@ class TripStudent(models.Model):
         return f"{self.student.name} on Trip #{self.trip_id}"
 
 
+class TripReceiptBook(models.Model):
+    trip = models.ForeignKey(Trip, on_delete=models.CASCADE, related_name='trip_receipt_books')
+    receipt_book = models.ForeignKey(ReceiptBook, on_delete=models.PROTECT, related_name='trip_assignments')
+    starting_leaf = models.PositiveIntegerField(null=True, blank=True)
+    ending_leaf = models.PositiveIntegerField(null=True, blank=True)
+    voided_leaves = models.CharField(max_length=255, blank=True, default='')
+
+    class Meta:
+        ordering = ['id']
+
+    def __str__(self):
+        return f"{self.receipt_book.label} (#{self.starting_leaf}-#{self.ending_leaf or '?'}) on Trip #{self.trip_id}"
+
+
 class InventoryMovement(models.Model):
     MOVEMENT_CHOICES = (
         ('opening_stock', 'Opening Stock'),

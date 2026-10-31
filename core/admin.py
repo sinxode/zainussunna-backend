@@ -1,7 +1,7 @@
 from django.contrib import admin
 from .models import (
     User, Campaign, Student, Place, ReceiptBook,
-    Trip, TripStudent, InventoryMovement, Expense,
+    Trip, TripStudent, TripReceiptBook, InventoryMovement, Expense,
     CommissionCalculation, CommissionPayout, AuditLog, ExternalCollection
 )
 
@@ -39,6 +39,10 @@ class TripAdmin(admin.ModelAdmin):
 @admin.register(TripStudent)
 class TripStudentAdmin(admin.ModelAdmin):
     list_display = ('trip', 'student', 'gross_collection_share', 'net_collection_share')
+
+@admin.register(TripReceiptBook)
+class TripReceiptBookAdmin(admin.ModelAdmin):
+    list_display = ('trip', 'receipt_book', 'starting_leaf', 'ending_leaf')
 
 @admin.register(InventoryMovement)
 class InventoryMovementAdmin(admin.ModelAdmin):

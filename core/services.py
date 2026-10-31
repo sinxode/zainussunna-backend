@@ -4,7 +4,7 @@ from django.db.models import Sum, Q, F
 from django.utils import timezone
 from django.core.exceptions import ValidationError
 from .models import (
-    Campaign, Student, Place, ReceiptBook, Trip, TripStudent,
+    Campaign, Student, Place, ReceiptBook, Trip, TripStudent, TripReceiptBook,
     InventoryMovement, Expense, CommissionCalculation, CommissionPayout,
     AuditLog, User, ExternalCollection, split_amount_in_paise
 )
@@ -108,12 +108,21 @@ class ReceiptBookService:
     @staticmethod
     def get_next_suggested_leaf(receipt_book: ReceiptBook) -> int:
         """Suggest the next available leaf in the receipt book based on recorded trips."""
-        highest_leaf = Trip.objects.filter(
+        highest_leaf_trip = Trip.objects.filter(
             receipt_book=receipt_book
         ).exclude(status='voided').order_by('-receipt_ending_leaf').first()
 
-        if highest_leaf and highest_leaf.receipt_ending_leaf:
-            next_leaf = highest_leaf.receipt_ending_leaf + 1
+        highest_from_trip = highest_leaf_trip.receipt_ending_leaf if (highest_leaf_trip and highest_leaf_trip.receipt_ending_leaf) else 0
+
+        highest_trb = TripReceiptBook.objects.filter(
+            receipt_book=receipt_book
+        ).exclude(trip__status='voided').order_by('-ending_leaf').first()
+
+        highest_from_trb = highest_trb.ending_leaf if (highest_trb and highest_trb.ending_leaf) else 0
+
+        max_ending = max(highest_from_trip, highest_from_trb)
+        if max_ending > 0:
+            next_leaf = max_ending + 1
             if next_leaf <= receipt_book.last_leaf:
                 return next_leaf
 
@@ -128,7 +137,7 @@ class ReceiptBookService:
         if start_leaf > end_leaf:
             raise ValidationError("Starting leaf cannot be greater than ending leaf.")
 
-        # Check for overlap with existing non-voided trips in the same receipt book
+        # Check for overlap with existing non-voided trips in the same receipt book (via direct trip assignment)
         conflicts = Trip.objects.filter(
             receipt_book=receipt_book,
             receipt_starting_leaf__isnull=False,
@@ -139,10 +148,25 @@ class ReceiptBookService:
             conflicts = conflicts.exclude(id=exclude_trip_id)
 
         for trip in conflicts:
-            # Overlap occurs if start <= trip.end and end >= trip.start
             if not (end_leaf < trip.receipt_starting_leaf or start_leaf > trip.receipt_ending_leaf):
                 raise ValidationError(
-                    f"Receipt leaf range {start_leaf}-{end_leaf} overlaps with Trip #{trip.id} ({trip.receipt_starting_leaf}-{trip.receipt_ending_leaf})."
+                    f"Receipt leaf range {start_leaf}-{end_leaf} in {receipt_book.label} overlaps with Trip #{trip.id} ({trip.receipt_starting_leaf}-{trip.receipt_ending_leaf})."
+                )
+
+        # Check for overlap with TripReceiptBook assignments
+        trb_conflicts = TripReceiptBook.objects.filter(
+            receipt_book=receipt_book,
+            starting_leaf__isnull=False,
+            ending_leaf__isnull=False,
+        ).exclude(trip__status='voided')
+
+        if exclude_trip_id:
+            trb_conflicts = trb_conflicts.exclude(trip_id=exclude_trip_id)
+
+        for trb in trb_conflicts:
+            if not (end_leaf < trb.starting_leaf or start_leaf > trb.ending_leaf):
+                raise ValidationError(
+                    f"Receipt leaf range {start_leaf}-{end_leaf} in {receipt_book.label} overlaps with Trip #{trb.trip_id} ({trb.starting_leaf}-{trb.ending_leaf})."
                 )
 
 
@@ -159,11 +183,13 @@ class TripService:
         receipt_starting_leaf: int | None,
         bus_fare: Decimal,
         notes: str,
-        user: User | None
+        user: User | None,
+        receipt_books: list[dict] | None = None
     ) -> Trip:
         """
         Atomic dispatch of a group of 1 to 3 students.
         Ensures stock availability and prevents double-assignment of students.
+        Supports multiple receipt books per trip.
         """
         if campaign.status == 'closed':
             raise ValidationError("Cannot dispatch trips for a closed campaign.")
@@ -180,6 +206,23 @@ class TripService:
         students = list(Student.objects.filter(id__in=student_ids, is_active=True))
         if len(students) != len(student_ids):
             raise ValidationError("One or more selected students are invalid or inactive.")
+
+        # Consolidate receipt books list
+        rb_list = []
+        if receipt_books:
+            rb_list = list(receipt_books)
+        elif receipt_book:
+            rb_list = [{'receipt_book': receipt_book, 'starting_leaf': receipt_starting_leaf}]
+
+        # Validate starting leaves
+        for rb_item in rb_list:
+            bk = rb_item.get('receipt_book')
+            st_leaf = rb_item.get('starting_leaf')
+            if bk and st_leaf is not None:
+                if st_leaf < bk.first_leaf or st_leaf > bk.last_leaf:
+                    raise ValidationError(
+                        f"Receipt leaf {st_leaf} is outside book range {bk.first_leaf}-{bk.last_leaf} for {bk.label}."
+                    )
 
         with transaction.atomic():
             # Check if any student is currently on an open trip
@@ -202,12 +245,9 @@ class TripService:
             # Atomic inventory check
             InventoryService.assert_stock_available(campaign, calendars_issued)
 
-            # Receipt leaf validation if starting leaf provided
-            if receipt_book and receipt_starting_leaf:
-                if receipt_starting_leaf < receipt_book.first_leaf or receipt_starting_leaf > receipt_book.last_leaf:
-                    raise ValidationError(
-                        f"Receipt leaf {receipt_starting_leaf} is outside book range {receipt_book.first_leaf}-{receipt_book.last_leaf}."
-                    )
+            # Primary receipt book for backward compatibility
+            primary_book = rb_list[0]['receipt_book'] if rb_list else receipt_book
+            primary_starting_leaf = rb_list[0].get('starting_leaf') if rb_list else receipt_starting_leaf
 
             trip = Trip.objects.create(
                 campaign=campaign,
@@ -216,12 +256,20 @@ class TripService:
                 departure_time=departure_time,
                 calendars_issued=calendars_issued,
                 bus_fare=bus_fare,
-                receipt_book=receipt_book,
-                receipt_starting_leaf=receipt_starting_leaf,
+                receipt_book=primary_book,
+                receipt_starting_leaf=primary_starting_leaf,
                 discrepancy_notes=notes,
                 created_by=user,
                 status='in_progress',
             )
+
+            # Save all TripReceiptBook records
+            for rb_item in rb_list:
+                TripReceiptBook.objects.create(
+                    trip=trip,
+                    receipt_book=rb_item['receipt_book'],
+                    starting_leaf=rb_item.get('starting_leaf')
+                )
 
             for student in students:
                 TripStudent.objects.create(trip=trip, student=student)
@@ -268,11 +316,13 @@ class TripService:
         receipt_ending_leaf: int | None,
         voided_leaves: str,
         discrepancy_notes: str,
-        user: User | None
+        user: User | None,
+        receipt_books: list[dict] | None = None
     ) -> Trip:
         """
         Settle a returned trip atomically.
         Calculates exact shares, checks discrepancies, updates inventory, and recalculates commissions.
+        Supports multiple receipt books per trip.
         """
         with transaction.atomic():
             trip = Trip.objects.select_for_update().get(id=trip.id)
@@ -288,11 +338,27 @@ class TripService:
             if cash_collection < 0 or gpay_collection < 0 or food_expense < 0:
                 raise ValidationError("Monetary values cannot be negative.")
 
-            # Validate receipt range if provided
-            if receipt_book and receipt_starting_leaf and receipt_ending_leaf:
-                ReceiptBookService.validate_leaf_range(
-                    receipt_book, receipt_starting_leaf, receipt_ending_leaf, exclude_trip_id=trip.id
-                )
+            # Consolidate receipt books list
+            rb_list = []
+            if receipt_books:
+                rb_list = list(receipt_books)
+            elif receipt_book:
+                rb_list = [{
+                    'receipt_book': receipt_book,
+                    'starting_leaf': receipt_starting_leaf,
+                    'ending_leaf': receipt_ending_leaf,
+                    'voided_leaves': voided_leaves,
+                }]
+
+            # Validate receipt ranges for all books
+            for rb_item in rb_list:
+                bk = rb_item.get('receipt_book')
+                st_leaf = rb_item.get('starting_leaf')
+                end_leaf = rb_item.get('ending_leaf')
+                if bk and st_leaf is not None and end_leaf is not None:
+                    ReceiptBookService.validate_leaf_range(
+                        bk, st_leaf, end_leaf, exclude_trip_id=trip.id
+                    )
 
             total_collection = cash_collection + gpay_collection
             expected_min_collection = Decimal(calendars_sold) * trip.campaign.min_expected_collection_per_calendar
@@ -335,16 +401,37 @@ class TripService:
             trip.cash_collection = cash_collection
             trip.gpay_collection = gpay_collection
             trip.food_expense = food_expense
-            trip.receipt_book = receipt_book or trip.receipt_book
-            trip.receipt_starting_leaf = receipt_starting_leaf
-            trip.receipt_ending_leaf = receipt_ending_leaf
-            trip.voided_leaves = voided_leaves
+
+            if rb_list:
+                primary = rb_list[0]
+                trip.receipt_book = primary['receipt_book']
+                trip.receipt_starting_leaf = primary.get('starting_leaf')
+                trip.receipt_ending_leaf = primary.get('ending_leaf')
+                trip.voided_leaves = primary.get('voided_leaves', '')
+            else:
+                trip.receipt_book = receipt_book or trip.receipt_book
+                trip.receipt_starting_leaf = receipt_starting_leaf
+                trip.receipt_ending_leaf = receipt_ending_leaf
+                trip.voided_leaves = voided_leaves
+
             trip.discrepancy_notes = discrepancy_notes
             trip.status = 'settled'
             trip.review_status = review_status
             trip.settled_by = user
             trip.settled_at = timezone.now()
             trip.save()
+
+            # Sync TripReceiptBook records
+            if rb_list:
+                TripReceiptBook.objects.filter(trip=trip).delete()
+                for rb_item in rb_list:
+                    TripReceiptBook.objects.create(
+                        trip=trip,
+                        receipt_book=rb_item['receipt_book'],
+                        starting_leaf=rb_item.get('starting_leaf'),
+                        ending_leaf=rb_item.get('ending_leaf'),
+                        voided_leaves=rb_item.get('voided_leaves', ''),
+                    )
 
             # Record inventory movements: sold and returned unsold
             if calendars_sold > 0:
@@ -598,18 +685,73 @@ class TripService:
             if 'notes' in data and data['notes'] is not None:
                 trip.discrepancy_notes = data['notes']
 
-            # Receipt Book & Starting Leaf
-            if 'receipt_book' in data:
-                trip.receipt_book = data['receipt_book']
-            if 'receipt_starting_leaf' in data:
-                trip.receipt_starting_leaf = data['receipt_starting_leaf']
+            # Receipt Books Handling (Multiple and Legacy)
+            if 'receipt_books' in data:
+                rb_list = data['receipt_books']
+                for rb_item in rb_list:
+                    bk = rb_item.get('receipt_book')
+                    st_leaf = rb_item.get('starting_leaf')
+                    end_leaf = rb_item.get('ending_leaf')
+                    if bk and st_leaf is not None:
+                        if st_leaf < bk.first_leaf or st_leaf > bk.last_leaf:
+                            raise ValidationError(
+                                f"Receipt leaf {st_leaf} is outside book range {bk.first_leaf}-{bk.last_leaf} for {bk.label}."
+                            )
+                    if bk and st_leaf is not None and end_leaf is not None:
+                        ReceiptBookService.validate_leaf_range(
+                            bk, st_leaf, end_leaf, exclude_trip_id=trip.id
+                        )
 
-            if trip.receipt_book and trip.receipt_starting_leaf:
-                if (trip.receipt_starting_leaf < trip.receipt_book.first_leaf or
-                    trip.receipt_starting_leaf > trip.receipt_book.last_leaf):
-                    raise ValidationError(
-                        f"Receipt starting leaf {trip.receipt_starting_leaf} is outside book range {trip.receipt_book.first_leaf}-{trip.receipt_book.last_leaf}."
+                TripReceiptBook.objects.filter(trip=trip).delete()
+                for rb_item in rb_list:
+                    TripReceiptBook.objects.create(
+                        trip=trip,
+                        receipt_book=rb_item['receipt_book'],
+                        starting_leaf=rb_item.get('starting_leaf'),
+                        ending_leaf=rb_item.get('ending_leaf'),
+                        voided_leaves=rb_item.get('voided_leaves', ''),
                     )
+
+                if rb_list:
+                    primary = rb_list[0]
+                    trip.receipt_book = primary['receipt_book']
+                    trip.receipt_starting_leaf = primary.get('starting_leaf')
+                    if 'ending_leaf' in primary:
+                        trip.receipt_ending_leaf = primary.get('ending_leaf')
+                    if 'voided_leaves' in primary:
+                        trip.voided_leaves = primary.get('voided_leaves', '')
+                else:
+                    trip.receipt_book = None
+                    trip.receipt_starting_leaf = None
+                    trip.receipt_ending_leaf = None
+                    trip.voided_leaves = ''
+            else:
+                # Receipt Book & Starting Leaf (Legacy fallback)
+                if 'receipt_book' in data:
+                    trip.receipt_book = data['receipt_book']
+                if 'receipt_starting_leaf' in data:
+                    trip.receipt_starting_leaf = data['receipt_starting_leaf']
+
+                if trip.receipt_book and trip.receipt_starting_leaf:
+                    if (trip.receipt_starting_leaf < trip.receipt_book.first_leaf or
+                        trip.receipt_starting_leaf > trip.receipt_book.last_leaf):
+                        raise ValidationError(
+                            f"Receipt starting leaf {trip.receipt_starting_leaf} is outside book range {trip.receipt_book.first_leaf}-{trip.receipt_book.last_leaf}."
+                        )
+                # Keep TripReceiptBook in sync with legacy fields
+                if 'receipt_book' in data or 'receipt_starting_leaf' in data:
+                    if trip.receipt_book:
+                        trb = TripReceiptBook.objects.filter(trip=trip).first()
+                        if trb:
+                            trb.receipt_book = trip.receipt_book
+                            trb.starting_leaf = trip.receipt_starting_leaf
+                            trb.save()
+                        else:
+                            TripReceiptBook.objects.create(
+                                trip=trip,
+                                receipt_book=trip.receipt_book,
+                                starting_leaf=trip.receipt_starting_leaf
+                            )
 
             # Calendars Issued
             if 'calendars_issued' in data and data['calendars_issued'] is not None:
